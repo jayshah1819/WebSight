@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebSight - WebGPU Profiler</title>
+    <script src="profiler-standalone.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Consolas', monospace;
+            background: #ffffff;
+            color: #333;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            font-size: 24px;
+            font-weight: normal;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        
+        .section {
+            border: 1px solid #ddd;
+            padding: 20px;
+            margin-bottom: 20px;
+            background: #ffffff;
+        }
+        
+        .charts-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        
+        label {
+            color: #333;
+            margin-right: 10px;
+            font-size: 14px;
+        }
+        
+        select {
+            background: #ffffff;
+            color: #333;
+            border: 1px solid #999;
+            padding: 8px 12px;
+            font-family: inherit;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        
+        select:focus {
+            outline: none;
+            border-color: #666;
+        }
+        
+        button {
+            background: #ffffff;
+            color: #333;
+            border: 1px solid #999;
+            padding: 10px 20px;
+            font-family: inherit;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        button:hover {
+            background: #f0f0f0;
+            border-color: #666;
+        }
+        
+        button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        
+        button:disabled:hover {
+            background: #ffffff;
+            border-color: #999;
+        }
+        
+        #results {
+            border: 1px solid #ddd;
+            padding: 20px;
+            margin: 20px 0;
+            background: #ffffff;
+            white-space: pre-wrap;
+            font-size: 13px;
+            color: #000000;
+            overflow-x: auto;
+            max-width: 100%;
+            resize: both;
+        }
+        
+        #plot, #plot2, #plot3 {
+            border: 1px solid #ddd;
+            padding: 15px;
+            background: #ffffff;
+            height: 400px;
+            resize: both;
+            overflow: auto;
+        }
+        
+        .arrow {
+            display: inline-block;
+            margin-right: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebSight - WebGPU Profiler</h1>
+        
+        <div class="section">
+            <h2>Scalability Benchmark</h2>
+            <div class="controls">
+                <div>
+                    <label>Current Input Size:</label>
+                    <input type="number" id="currentSize" placeholder="e.g., 1048576" style="width: 200px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                    <span style="color: #666; font-size: 12px; margin-left: 8px;">(elements)</span>
+                </div>
+                
+                <div>
+                    <label>Test Type:</label>
+                    <select id="testType">
+                        <option value="memcopy">Memory Copy (Bandwidth Test)</option>
+                        <option value="compute">Compute Intensive</option>
+                    </select>
+                </div>
+                
+                <div>
+                    <label>Steps:</label>
+                    <select id="steps">
+                        <option value="5">5 (Quick)</option>
+                        <option value="10" selected>10 (Default)</option>
+                        <option value="15">15 (Detailed)</option>
+                    </select>
+                </div>
+                
+                <button id="runBtn"><span class="arrow"></span>Run Benchmark</button>
+                <button id="exportBtn" disabled><span class="arrow"></span>Export Results</button>
+            </div>
+        </div>
+
+        <div class="charts-container">
+            <div id="plot"></div>
+            <div id="plot2"></div>
+        </div>
+        <div id="results"></div>
+
+        <!-- Profiler Section -->
+        <div class="section" style="margin-top: 40px;">
+            <h2 style="margin-bottom: 15px;">Real-Time Profiling</h2>
+            <button onclick="startProfiling()" style="margin-right: 10px;">Start Profiling</button>
+            <button onclick="clearProfilingData()">Clear Data</button>
+            <button onclick="exportProfilingData()">Export JSON</button>
+        </div>
+
+        <div class="section">
+            <h3>Statistics</h3>
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 15px;">
+                <div style="padding: 15px; border: 1px solid #ddd; background: #fff;">
+                    <div style="font-size: 12px; color: #666;">Total Dispatches</div>
+                    <div id="totalDispatches" style="font-size: 24px; font-weight: 600;">0</div>
+                </div>
+                <div style="padding: 15px; border: 1px solid #ddd; background: #fff;">
+                    <div style="font-size: 12px; color: #666;">Active Buffers</div>
+                    <div id="bufferCount" style="font-size: 24px; font-weight: 600;">0</div>
+                </div>
+                <div style="padding: 15px; border: 1px solid #ddd; background: #fff;">
+                    <div style="font-size: 12px; color: #666;">Avg GPU Time</div>
+                    <div id="avgGpuTime" style="font-size: 24px; font-weight: 600;">-</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- NEW: Side-by-side layout for Dispatches and Kernel Performance -->
+        <div class="section">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <!-- Left: Dispatches Box -->
+                <div style="border: 1px solid #ddd; padding: 15px; background: #fff;">
+                    <h3 style="margin: 0 0 15px 0; border-bottom: 2px solid #333; padding-bottom: 10px;">Dispatches</h3>
+                    <div id="dispatchList" style="max-height: 600px; overflow-y: auto;"></div>
+                </div>
+                
+                <!-- Right: Kernel Performance Box -->
+                <div style="border: 1px solid #ddd; padding: 15px; background: #fff;">
+                    <h3 style="margin: 0 0 15px 0; border-bottom: 2px solid #333; padding-bottom: 10px;">Kernel Performance</h3>
+                    <div id="kernelPerformanceGrid" style="display: flex; flex-direction: column; gap: 20px; max-height: 600px; overflow-y: auto;">
+                        <!-- Kernel boxes will be dynamically inserted here (stacked vertically) -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>Buffers</h3>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px;">
+                <div style="border: 1px solid #ddd; padding: 15px; background: #ffffff;">
+                    <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 600; border-bottom: 2px solid #333; padding-bottom: 5px;">Input Buffers</h4>
+                    <div id="inputBuffers" style="max-height: 300px; overflow-y: auto;"></div>
+                </div>
+                <div style="border: 1px solid #ddd; padding: 15px; background: #ffffff;">
+                    <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 600; border-bottom: 2px solid #333; padding-bottom: 5px;">Output Buffers</h4>
+                    <div id="outputBuffers" style="max-height: 300px; overflow-y: auto;"></div>
+                </div>
+                <div style="border: 1px solid #ddd; padding: 15px; background: #ffffff;">
+                    <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 600; border-bottom: 2px solid #333; padding-bottom: 5px;">Atomic Buffers</h4>
+                    <div id="atomicBuffers" style="max-height: 300px; overflow-y: auto;"></div>
+                </div>
+                <div style="border: 1px solid #ddd; padding: 15px; background: #ffffff;">
+                    <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 600; border-bottom: 2px solid #333; padding-bottom: 5px;">Other Buffers</h4>
+                    <div id="otherBuffers" style="max-height: 300px; overflow-y: auto;"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>Optimization Suggestions</h3>
+            <div id="suggestions" style="margin-top: 15px; padding: 15px; background: #ffffff;">
+                <div style="color: #666; font-size: 13px;">
+                    Run profiling to see optimization suggestions based on detected bottlenecks.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let benchmarkResults = null;
+        
+        const shaderTemplates = {
+            memcopy: `
+                @group(0) @binding(0) var<storage, read> input: array<f32>;
+                @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+                
+                @compute @workgroup_size(256)
+                fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                    let idx = gid.x;
+                    if (idx < INPUT_SIZE) {
+                        output[idx] = input[idx];
+                    }
+                }
+            `,
+            compute: `
+                @group(0) @binding(0) var<storage, read> input: array<f32>;
+                @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+                
+                @compute @workgroup_size(256)
+                fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                    let idx = gid.x;
+                    if (idx < INPUT_SIZE) {
+                        var sum = 0.0;
+                        // Compute-heavy workload
+                        for (var i = 0u; i < 100u; i++) {
+                            sum += sin(input[idx] + f32(i)) * cos(input[idx] - f32(i));
+                        }
+                        output[idx] = sum;
+                    }
+                }
+            `,
+            histogram: `
+                @group(0) @binding(0) var<storage, read> input: array<f32>;
+                @group(0) @binding(1) var<storage, read_write> output: array<atomic<u32>>;
+                
+                @compute @workgroup_size(256)
+                fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                    let idx = gid.x;
+                    if (idx < INPUT_SIZE) {
+                        let value = input[idx];
+                        let bin = u32(value * 64.0) % 64u;
+                        atomicAdd(&output[bin], 1u);
+                    }
+                }
+            `
+        };
+
+        document.getElementById('runBtn').addEventListener('click', async () => {
+            const runBtn = document.getElementById('runBtn');
+            const exportBtn = document.getElementById('exportBtn');
+            const resultsDiv = document.getElementById('results');
+            const currentSizeInput = document.getElementById('currentSize').value;
+            const currentSize = currentSizeInput ? parseInt(currentSizeInput) : null;
+            
+            runBtn.disabled = true;
+            runBtn.textContent = 'Running...';
+            resultsDiv.textContent = 'Starting benchmark...\n';
+            
+            try {
+                // Start profiler
+                await WebSight.start();
+                
+                const testType = document.getElementById('testType').value;
+                const steps = parseInt(document.getElementById('steps').value);
+                
+                // If user provided current size, start from there
+                const minSize = currentSize && currentSize > 256 ? currentSize : 256;
+                const maxSize = currentSize && currentSize > 256 ? Math.max(currentSize * 10, 16777216) : 16777216;
+                
+                resultsDiv.textContent += `Test: ${testType}\n`;
+                if (currentSize && currentSize > 256) {
+                    resultsDiv.textContent += `Starting from your input size: ${currentSize.toLocaleString()} elements\n`;
+                    resultsDiv.textContent += `Testing up to: ${maxSize.toLocaleString()} elements\n`;
+                }
+                resultsDiv.textContent += `Steps: ${steps}\n\n`;
+                
+                // Run benchmark
+                benchmarkResults = await WebSight.benchmarkScalability(
+                    shaderTemplates[testType],
+                    {
+                        minSize: minSize,
+                        maxSize: maxSize,
+                        steps: steps,
+                        workgroupSize: 256,
+                        iterations: 3
+                    }
+                );
+                
+                // Display results
+                resultsDiv.textContent += '=== RESULTS ===\n\n';
+                resultsDiv.textContent += `Peak GPU Bandwidth: ${benchmarkResults.peakBandwidth.toFixed(1)} GB/s\n`;
+                resultsDiv.textContent += `Min Achieved: ${benchmarkResults.summary.minBandwidth.toFixed(2)} GB/s\n`;
+                resultsDiv.textContent += `Max Achieved: ${benchmarkResults.summary.maxBandwidth.toFixed(2)} GB/s\n`;
+                resultsDiv.textContent += `Average: ${benchmarkResults.summary.avgBandwidth.toFixed(2)} GB/s\n`;
+                resultsDiv.textContent += `Efficiency: ${(benchmarkResults.summary.avgBandwidth / benchmarkResults.peakBandwidth * 100).toFixed(1)}%\n`;
+                resultsDiv.textContent += `Total Input Memory Processed: ${benchmarkResults.summary.totalInputMemoryMB.toFixed(2)} MB\n\n`;
+                
+                // Atomic info
+                if (benchmarkResults.summary.hasAtomics) {
+                    resultsDiv.textContent += `  ATOMIC OPERATIONS DETECTED\n`;
+                    resultsDiv.textContent += `Atomic Bins: ${benchmarkResults.summary.atomicBinCount}\n`;
+                    resultsDiv.textContent += `Atomic Buffer Size: ${(benchmarkResults.summary.atomicBinCount * 4 / 1024).toFixed(2)} KB\n\n`;
+                }
+                
+                resultsDiv.textContent += 'Size    | CPU Time | GPU Time | Input MB | Output MB | Total MB | BW (GB/s) | GEPS   ';
+                if (benchmarkResults.summary.hasAtomics) {
+                    resultsDiv.textContent += '| Threads/Bin';
+                }
+                resultsDiv.textContent += '\n';
+                resultsDiv.textContent += '─'.repeat(benchmarkResults.summary.hasAtomics ? 110 : 95) + '\n';
+                
+                benchmarkResults.results.forEach(r => {
+                    const sizeStr = r.size >= 1048576 
+                        ? `${(r.size / 1048576).toFixed(1)}M`.padStart(7)
+                        : r.size >= 1024
+                        ? `${(r.size / 1024).toFixed(0)}K`.padStart(7)
+                        : `${r.size}`.padStart(7);
+                    
+                    resultsDiv.textContent += 
+                        `${sizeStr} | ` +
+                        `${r.cpuTimeMS.toFixed(2).padStart(8)} | ` +
+                        `${r.gpuTimeMS.toFixed(2).padStart(8)} | ` +
+                        `${r.inputMemoryMB.toFixed(2).padStart(8)} | ` +
+                        `${r.outputMemoryMB.toFixed(2).padStart(9)} | ` +
+                        `${r.totalMemoryMB.toFixed(2).padStart(8)} | ` +
+                        `${r.bandwidth.toFixed(2).padStart(9)} | ` +
+                        `${r.throughputGEPS.toFixed(2).padStart(6)}`;
+                    
+                    if (benchmarkResults.summary.hasAtomics) {
+                        resultsDiv.textContent += ` | ${r.avgThreadsPerBin.toFixed(0).padStart(11)}`;
+                    }
+                    
+                    resultsDiv.textContent += '\n';
+                });
+                
+                // Plot results
+                plotResults(benchmarkResults);
+                
+                exportBtn.disabled = false;
+                runBtn.textContent = 'Run Benchmark';
+                runBtn.disabled = false;
+                
+            } catch (error) {
+                resultsDiv.textContent += `\nError: ${error.message}\n`;
+                runBtn.textContent = 'Run Benchmark';
+                runBtn.disabled = false;
+            }
+        });
+        
+        document.getElementById('exportBtn').addEventListener('click', () => {
+            if (!benchmarkResults) return;
+            
+            const data = {
+                testType: document.getElementById('testType').value,
+                timestamp: new Date().toISOString(),
+                ...benchmarkResults
+            };
+            
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `scalability-benchmark-${Date.now()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+        
+        function plotResults(data) {
+            // Chart 1: GPU Time vs Input Size
+            const gpuTimeTrace = {
+                x: data.results.map(r => r.sizeMB),
+                y: data.results.map(r => r.gpuTimeMS),
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: 'GPU Time',
+                line: { color: '#000000', width: 3 },
+                marker: { size: 8, color: '#000000' }
+            };
+            
+            const timeLayout = {
+                title: {
+                    text: 'GPU Time vs Input Size',
+                    font: { color: '#333333', size: 18, family: 'SF Mono, Monaco, monospace' }
+                },
+                xaxis: {
+                    title: { text: 'Input Size (MB)', font: { color: '#333333', size: 14 } },
+                    type: 'log',
+                    gridcolor: '#e0e0e0',
+                    color: '#333333',
+                    zerolinecolor: '#cccccc',
+                    tickfont: { color: '#333333' }
+                },
+                yaxis: {
+                    title: { text: 'GPU Time (ms)', font: { color: '#333333', size: 14 } },
+                    gridcolor: '#e0e0e0',
+                    color: '#333333',
+                    zerolinecolor: '#cccccc',
+                    tickfont: { color: '#333333' }
+                },
+                plot_bgcolor: '#ffffff',
+                paper_bgcolor: '#ffffff',
+                font: { family: 'SF Mono, Monaco, monospace', color: '#333333' },
+                legend: { font: { color: '#333333' } }
+            };
+            
+            Plotly.newPlot('plot', [gpuTimeTrace], timeLayout);
+            
+            // Chart 2: Bandwidth vs Input Size
+            const bandwidthTrace = {
+                x: data.results.map(r => r.sizeMB),
+                y: data.results.map(r => r.bandwidth),
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: 'Achieved Bandwidth',
+                line: { color: '#000000', width: 3 },
+                marker: { size: 8, color: '#000000' }
+            };
+            
+            const peakTrace = {
+                x: data.results.map(r => r.sizeMB),
+                y: data.results.map(r => data.peakBandwidth),
+                type: 'scatter',
+                mode: 'lines',
+                name: 'Peak GPU Bandwidth',
+                line: { color: '#666666', width: 2, dash: 'dash' }
+            };
+            
+            const bandwidthLayout = {
+                title: {
+                    text: 'Bandwidth vs Input Size',
+                    font: { color: '#333333', size: 18, family: 'SF Mono, Monaco, monospace' }
+                },
+                xaxis: {
+                    title: { text: 'Input Size (MB)', font: { color: '#333333', size: 14 } },
+                    type: 'log',
+                    gridcolor: '#e0e0e0',
+                    color: '#333333',
+                    zerolinecolor: '#cccccc',
+                    tickfont: { color: '#333333' }
+                },
+                yaxis: {
+                    title: { text: 'Bandwidth (GB/s)', font: { color: '#333333', size: 14 } },
+                    gridcolor: '#e0e0e0',
+                    color: '#333333',
+                    zerolinecolor: '#cccccc',
+                    tickfont: { color: '#333333' }
+                },
+                plot_bgcolor: '#ffffff',
+                paper_bgcolor: '#ffffff',
+                font: { family: 'SF Mono, Monaco, monospace', color: '#333333' },
+                legend: { font: { color: '#333333' } }
+            };
+            
+            Plotly.newPlot('plot2', [bandwidthTrace, peakTrace], bandwidthLayout);
+            
+            // Chart 3: Atomic Contention (only if atomics detected)
+            if (data.summary.hasAtomics) {
+                const contentionTrace = {
+                    x: data.results.map(r => r.sizeMB),
+                    y: data.results.map(r => r.avgThreadsPerBin),
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: 'Threads per Atomic Bin',
+                    line: { color: '#000000', width: 2 },
+                    marker: { size: 8, color: '#000000' }
+                };
+                
+                const contentionLayout = {
+                    title: {
+                        text: `Atomic Contention (${data.summary.atomicBinCount} bins)`,
+                        font: { color: '#333333', size: 18, family: 'SF Mono, Monaco, monospace' }
+                    },
+                    xaxis: {
+                        title: { text: 'Input Size (MB)', font: { color: '#333333', size: 14 } },
+                        type: 'log',
+                        gridcolor: '#dddddd',
+                        color: '#333333',
+                        zerolinecolor: '#dddddd',
+                        tickfont: { color: '#333333' }
+                    },
+                    yaxis: {
+                        title: { text: 'Avg Threads per Bin', font: { color: '#333333', size: 14 } },
+                        type: 'log',
+                        gridcolor: '#dddddd',
+                        color: '#333333',
+                        zerolinecolor: '#dddddd',
+                        tickfont: { color: '#333333' }
+                    },
+                    plot_bgcolor: '#ffffff',
+                    paper_bgcolor: '#ffffff',
+                    font: { family: 'SF Mono, Monaco, monospace', color: '#333333' },
+                    legend: { font: { color: '#333333' } }
+                };
+                
+                const plotDiv = document.createElement('div');
+                plotDiv.id = 'plot3';
+                plotDiv.style.cssText = 'border: 1px solid #ddd; padding: 20px; margin: 20px 0; background: #ffffff;';
+                document.getElementById('plot2').after(plotDiv);
+                
+                Plotly.newPlot('plot3', [contentionTrace], contentionLayout);
+            }
+        }
+
+        // Profiler functions
+        let profilingInterval = null;
+
+        async function startProfiling() {
+            await WebSight.start();
+            updateProfilingUI();
+            updateKernelPerformance(); // Update kernel graphs
+            if (profilingInterval) clearInterval(profilingInterval);
+            profilingInterval = setInterval(() => {
+                updateProfilingUI();
+                updateKernelPerformance();
+            }, 1000);
+        }
+
+        function clearProfilingData() {
+            WebSight.clear();
+            updateProfilingUI();
+            updateKernelPerformance();
+        }
+
+        function exportProfilingData() {
+            WebSight.export();
+        }
+
+        // NEW: Update Kernel Performance Boxes
+        function updateKernelPerformance() {
+            const kernels = WebSight.listKernels();
+            const grid = document.getElementById('kernelPerformanceGrid');
+            
+            if (!kernels || kernels.length === 0) {
+                grid.innerHTML = '<div style="grid-column: 1 / -1; color: #666; text-align: center; padding: 40px;">No kernels captured yet. Start profiling to see kernel performance.</div>';
+                return;
+            }
+            
+            grid.innerHTML = '';
+            
+            kernels.forEach((kernel, kernelIndex) => {
+                const summary = WebSight.getKernelSummary(kernel.id);
+                if (!summary || summary.dispatches.length === 0) return;
+                
+                // Collect unique buffers used by this kernel
+                const bufferMap = new Map();
+                summary.dispatches.forEach(dispatch => {
+                    if (dispatch.bufferBindings) {
+                        dispatch.bufferBindings.forEach(binding => {
+                            const bufferInfo = WebSight.getData().buffers[binding.bufferId];
+                            if (bufferInfo && !bufferMap.has(binding.bufferId)) {
+                                bufferMap.set(binding.bufferId, {
+                                    id: binding.bufferId,
+                                    label: binding.bufferLabel || bufferInfo.label || binding.bufferId.slice(0, 8),
+                                    size: binding.size || bufferInfo.size,
+                                    usage: binding.usage || bufferInfo.usage,
+                                    access: binding.access
+                                });
+                            }
+                        });
+                    }
+                });
+                
+                const buffers = Array.from(bufferMap.values());
+                
+                // Format buffer sizes
+                const formatBytes = (bytes) => {
+                    if (bytes >= 1024*1024*1024) return (bytes / (1024*1024*1024)).toFixed(2) + ' GB';
+                    if (bytes >= 1024*1024) return (bytes / (1024*1024)).toFixed(2) + ' MB';
+                    if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+                    return bytes + ' B';
+                };
+                
+                // Create kernel box
+                const kernelBox = document.createElement('div');
+                kernelBox.style.cssText = 'border: 1px solid #ddd; padding: 15px; background: #fff;';
+                
+                // Kernel header
+                let bufferCardsHTML = '';
+                buffers.forEach((buffer, bufferIndex) => {
+                    const accessColor = buffer.access === 'write' ? '#e8f5e9' : 
+                                       buffer.access === 'read-write' ? '#fff3e0' : '#f5f5f5';
+                    const accessLabel = buffer.access === 'write' ? 'Output' : 
+                                       buffer.access === 'read-write' ? 'Atomic' : 'Input';
+                    
+                    bufferCardsHTML += `
+                        <div style="padding: 10px; background: ${accessColor}; border-radius: 4px; border: 1px solid #ddd;">
+                            <div style="font-size: 10px; color: #666; margin-bottom: 4px;">${accessLabel}: ${buffer.label}</div>
+                            <div style="font-size: 13px; font-weight: 600;">${formatBytes(buffer.size)}</div>
+                        </div>
+                    `;
+                });
+                
+                // Generate unique IDs for each buffer graph
+                const graphIDs = buffers.map((_, idx) => `kernel_${kernelIndex}_buffer_${idx}`);
+                const graphDivs = graphIDs.map(id => `<div id="${id}" style="height: 200px; margin-bottom: 10px;"></div>`).join('');
+                
+                kernelBox.innerHTML = `
+                    <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 600;">
+                        Kernel ${kernelIndex + 1}: ${kernel.label}
+                    </h4>
+                    <div style="font-size: 11px; color: #666; margin-bottom: 10px;">
+                        ${kernel.dispatchCount} dispatches | Avg: ${kernel.avgTime.toFixed(2)}μs
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 15px;">
+                        ${bufferCardsHTML}
+                    </div>
+                    ${graphDivs}
+                `;
+                
+                grid.appendChild(kernelBox);
+                
+                // Plot bandwidth graph for each buffer
+                buffers.forEach((buffer, bufferIndex) => {
+                    const bandwidthData = summary.dispatches.map((dispatch, dispatchIdx) => {
+                        // Find this buffer's binding in this dispatch
+                        const binding = dispatch.bufferBindings?.find(b => b.bufferId === buffer.id);
+                        if (!binding || !dispatch.gpuTime) return { x: dispatchIdx, y: 0 };
+                        
+                        // Calculate bandwidth for this specific buffer
+                        const bufferBytes = binding.size || buffer.size;
+                        const bandwidth = (bufferBytes / 1e9) / (dispatch.gpuTime / 1e6);
+                        return { x: dispatchIdx, y: bandwidth };
+                    });
+                    
+                    Plotly.newPlot(graphIDs[bufferIndex], [{
+                        x: bandwidthData.map(d => d.x),
+                        y: bandwidthData.map(d => d.y),
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        name: buffer.label,
+                        line: { color: '#000000', width: 2 },
+                        marker: { size: 6, color: '#000000' }
+                    }], {
+                        title: { text: `${buffer.label} Bandwidth (GB/s)`, font: { size: 12, color: '#333' } },
+                        xaxis: { title: 'Dispatch #', gridcolor: '#e0e0e0', tickfont: { size: 10 } },
+                        yaxis: { title: 'BW (GB/s)', gridcolor: '#e0e0e0', tickfont: { size: 10 } },
+                        margin: { l: 50, r: 20, t: 40, b: 40 },
+                        plot_bgcolor: '#ffffff',
+                        paper_bgcolor: '#ffffff',
+                        font: { family: 'SF Mono, Monaco, monospace', size: 10 }
+                    }, { displayModeBar: false, responsive: true });
+                });
+            });
+        }
+
+        function updateProfilingUI() {
+            const data = WebSight.getData();
+            const stats = WebSight.getStats();
+            
+            document.getElementById('totalDispatches').textContent = data.dispatches.length;
+            document.getElementById('bufferCount').textContent = Object.keys(data.buffers).length;
+            document.getElementById('avgGpuTime').textContent = stats.averageGpuTime ? 
+                stats.averageGpuTime.toFixed(2) + ' μs' : '-';
+            
+            // Update dispatch list - Show only user's actual dispatches, not benchmark internals
+            const dispatchList = document.getElementById('dispatchList');
+            
+            // Filter out benchmark dispatches
+            const userDispatches = data.dispatches.filter(d => !d.pipelineLabel.includes('benchmark_pipeline_'));
+            
+            if (userDispatches.length === 0) {
+                dispatchList.innerHTML = '<div style="color: #666; padding: 20px; text-align: center;">No user dispatches captured yet. Run your WebGPU code to see dispatches here.</div>';
+            } else {
+                dispatchList.innerHTML = userDispatches.slice(-20).reverse().map(d => {
+                    // Timing confidence indicator
+                    const timingIcon = d.timingSource === 'gpu_timestamp' ? '⚡' : '⏱️';
+                    const timingColor = d.timingSource === 'gpu_timestamp' ? '#4CAF50' : '#FF9800';
+                    const timingTitle = d.timingSource === 'gpu_timestamp' 
+                        ? 'GPU timestamp (100% confidence)' 
+                        : 'CPU proxy timing (50% confidence)';
+                    
+                    return `
+                        <div style="border: 1px solid #ddd; padding: 12px; margin-bottom: 8px; background: #fff;">
+                            <div style="font-weight: 600; margin-bottom: 5px;">
+                                #${d.index}: ${d.pipelineLabel}
+                                <span style="color: ${timingColor}; font-size: 14px; margin-left: 8px;" title="${timingTitle}">${timingIcon}</span>
+                            </div>
+                            <div style="font-size: 12px; color: #666;">
+                                Workgroups: ${d.x}×${d.y}×${d.z} | 
+                                Time: ${d.gpuTime ? d.gpuTime.toFixed(2) + ' μs' : 'N/A'} | 
+                                ${d.bottleneck ? d.bottleneck.type + ' (' + d.bottleneck.confidence + '%)' : 'Analyzing...'}
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            }
+            
+            // NEW: Update Kernel Performance Boxes
+            updateKernelPerformance(data);
+            
+            // Helper function to decode buffer usage flags
+            function decodeUsageFlags(usage) {
+                const flags = [];
+                if (usage & 0x0001) flags.push('MAP_READ');
+                if (usage & 0x0002) flags.push('MAP_WRITE');
+                if (usage & 0x0004) flags.push('COPY_SRC');
+                if (usage & 0x0008) flags.push('COPY_DST');
+                if (usage & 0x0010) flags.push('INDEX');
+                if (usage & 0x0020) flags.push('VERTEX');
+                if (usage & 0x0040) flags.push('UNIFORM');
+                if (usage & 0x0080) flags.push('STORAGE');
+                if (usage & 0x0100) flags.push('INDIRECT');
+                if (usage & 0x0200) flags.push('QUERY_RESOLVE');
+                return flags.length > 0 ? flags.join(' | ') : 'NONE';
+            }
+            
+            // Generate meaningful buffer names
+            function getBufferDisplayName(b, usage, category) {
+                const sizeKB = (b.size / 1024).toFixed(2);
+                
+                // If label already has a meaningful name, use it
+                if (!b.label.startsWith('buffer_')) {
+                    return b.label;
+                }
+                
+                // Generate descriptive name based on category and size
+                const sizeMB = (b.size / (1024 * 1024)).toFixed(1);
+                let name = '';
+                
+                if (category === 'input') {
+                    name = `Input_${sizeMB}MB`;
+                } else if (category === 'output') {
+                    name = `Output_${sizeMB}MB`;
+                } else if (category === 'atomic') {
+                    name = `Atomic_${sizeMB}MB`;
+                } else {
+                    // Detect special purpose buffers
+                    if (usage & 0x0200) name = `QueryBuffer_${sizeKB}KB`;
+                    else if ((usage & 0x0001) && (usage & 0x0008)) name = `StagingBuffer_${sizeKB}KB`;
+                    else if (usage & 0x0040) name = `UniformBuffer_${sizeKB}KB`;
+                    else name = `Buffer_${sizeKB}KB`;
+                }
+                
+                return name;
+            }
+            
+            function formatBufferItem(b, accessCount, category) {
+                const sizeKB = (b.size / 1024).toFixed(2);
+                const usage = b.usage;
+                const displayName = getBufferDisplayName(b, usage, category);
+                
+                return `
+                    <div style="border: 1px solid #ddd; padding: 10px; margin-bottom: 8px; background: #fff;">
+                        <div style="font-weight: 600; margin-bottom: 3px; font-size: 13px;">${displayName}</div>
+                        <div style="font-size: 11px; color: #666;">
+                            <div>Size: ${sizeKB} KB</div>
+                            <div>Usage: ${decodeUsageFlags(usage)}</div>
+                            <div>Accesses: ${accessCount}x</div>
+                        </div>
+                    </div>
+                `;
+            }
+            
+            // Categorize buffers
+            const buffers = Object.values(data.buffers);
+            const inputBuffers = [];
+            const outputBuffers = [];
+            const atomicBuffers = [];
+            const otherBuffers = [];
+            
+            buffers.forEach(b => {
+                // Skip benchmark internal buffers
+                if (b.label.includes('benchmark_')) return;
+                
+                const accessCount = data.bufferHeatMap[b.id] || 0;
+                const usage = b.usage;
+                
+                // Detect atomic buffers by checking if shader uses atomics
+                // This is a heuristic - buffers with STORAGE | read_write often used for atomics
+                if (b.label.toLowerCase().includes('atomic') || 
+                    (b.hasAtomics !== undefined && b.hasAtomics)) {
+                    atomicBuffers.push({ buffer: b, accessCount });
+                }
+                // Input buffers: STORAGE with COPY_DST (written to from CPU)
+                else if ((usage & 0x0080) && (usage & 0x0008)) {
+                    inputBuffers.push({ buffer: b, accessCount });
+                }
+                // Output buffers: STORAGE with COPY_SRC (read back to CPU)
+                else if ((usage & 0x0080) && (usage & 0x0004)) {
+                    outputBuffers.push({ buffer: b, accessCount });
+                }
+                else {
+                    otherBuffers.push({ buffer: b, accessCount });
+                }
+            });
+            
+            // Update each buffer category
+            const inputDiv = document.getElementById('inputBuffers');
+            const outputDiv = document.getElementById('outputBuffers');
+            const atomicDiv = document.getElementById('atomicBuffers');
+            const otherDiv = document.getElementById('otherBuffers');
+            
+            inputDiv.innerHTML = inputBuffers.length > 0 
+                ? inputBuffers.map(({ buffer, accessCount }) => formatBufferItem(buffer, accessCount, 'input')).join('')
+                : '<div style="color: #999; padding: 10px; text-align: center; font-size: 12px;">No input buffers</div>';
+            
+            outputDiv.innerHTML = outputBuffers.length > 0
+                ? outputBuffers.map(({ buffer, accessCount }) => formatBufferItem(buffer, accessCount, 'output')).join('')
+                : '<div style="color: #999; padding: 10px; text-align: center; font-size: 12px;">No output buffers</div>';
+            
+            atomicDiv.innerHTML = atomicBuffers.length > 0
+                ? atomicBuffers.map(({ buffer, accessCount }) => formatBufferItem(buffer, accessCount, 'atomic')).join('')
+                : '<div style="color: #999; padding: 10px; text-align: center; font-size: 12px;">No atomic buffers</div>';
+            
+            otherDiv.innerHTML = otherBuffers.length > 0
+                ? otherBuffers.map(({ buffer, accessCount }) => formatBufferItem(buffer, accessCount, 'other')).join('')
+                : '<div style="color: #999; padding: 10px; text-align: center; font-size: 12px;">No other buffers</div>';
+            
+            // Update suggestions based on bottlenecks
+            const suggestionsDiv = document.getElementById('suggestions');
+            const bottlenecks = {};
+            data.dispatches.forEach(d => {
+                if (d.bottleneck) {
+                    bottlenecks[d.bottleneck.type] = (bottlenecks[d.bottleneck.type] || 0) + 1;
+                }
+            });
+            
+            if (Object.keys(bottlenecks).length === 0) {
+                suggestionsDiv.innerHTML = '<div style="color: #666; font-size: 13px;">Run profiling to see optimization suggestions based on detected bottlenecks.</div>';
+            } else {
+                const suggestions = [];
+                
+                if (bottlenecks['MEMORY_BANDWIDTH']) {
+                    suggestions.push({
+                        type: 'MEMORY_BANDWIDTH',
+                        count: bottlenecks['MEMORY_BANDWIDTH'],
+                        title: 'Memory Bandwidth Bottleneck',
+                        tips: [
+                            'Use vec4<f32> instead of f32 for coalesced 128-bit memory access',
+                            'Store intermediate results in workgroup shared memory (var<workgroup>)',
+                            'Reduce global memory reads by caching frequently accessed data',
+                            'Minimize buffer size - pack data tightly (u32 instead of f32 where possible)',
+                            'Use @group(0) @binding() with read_only storage buffers where applicable',
+                            'Consider splitting large buffers to improve cache utilization'
+                        ]
+                    });
+                }
+                
+                if (bottlenecks['DIVERGENCE']) {
+                    suggestions.push({
+                        type: 'DIVERGENCE',
+                        count: bottlenecks['DIVERGENCE'],
+                        title: 'Thread Divergence Detected',
+                        tips: [
+                            'Minimize branching in shaders (if/else statements)',
+                            'Reorganize workload to reduce conditional execution',
+                            'Use workgroup-level decisions instead of per-thread conditionals',
+                            'Consider splitting into multiple kernels with different code paths'
+                        ]
+                    });
+                }
+                
+                if (bottlenecks['OCCUPANCY']) {
+                    suggestions.push({
+                        type: 'OCCUPANCY',
+                        count: bottlenecks['OCCUPANCY'],
+                        title: 'Low Occupancy',
+                        tips: [
+                            'Reduce workgroup size to increase concurrent workgroups',
+                            'Minimize register usage per thread',
+                            'Reduce shared memory usage',
+                            'Balance workgroup size vs parallelism for your hardware'
+                        ]
+                    });
+                }
+                
+                if (bottlenecks['COMPUTE_BOUND']) {
+                    suggestions.push({
+                        type: 'COMPUTE_BOUND',
+                        count: bottlenecks['COMPUTE_BOUND'],
+                        title: 'Compute Bound (Good News!)',
+                        tips: [
+                            'Your memory access is already optimized - compute is the bottleneck',
+                            'Look for algorithmic improvements (reduce loop iterations, simplify math)',
+                            'Use built-in WGSL functions (dot, cross, normalize) instead of manual calculations',
+                            'Consider lookup tables (LUTs) for expensive functions like sin/cos/exp',
+                            'Profile with native tools to find hotspot operations'
+                        ]
+                    });
+                }
+                
+                if (bottlenecks['ATOMIC_SERIALIZATION']) {
+                    suggestions.push({
+                        type: 'ATOMIC_SERIALIZATION',
+                        count: bottlenecks['ATOMIC_SERIALIZATION'],
+                        title: 'Atomic Contention',
+                        tips: [
+                            'Use workgroup-local atomics first, then reduce to global once per workgroup',
+                            'Increase number of atomic bins/buckets to reduce thread collisions',
+                            'Batch atomic updates - accumulate locally then atomic once',
+                            'Consider lock-free algorithms or different data structure (tree reduction)',
+                            'Profile atomic hotspots - some bins may have higher contention than others'
+                        ]
+                    });
+                }
+                
+                if (bottlenecks['REGISTER_PRESSURE']) {
+                    suggestions.push({
+                        type: 'REGISTER_PRESSURE',
+                        count: bottlenecks['REGISTER_PRESSURE'],
+                        title: 'Register Pressure',
+                        tips: [
+                            'Reduce number of variables in shader',
+                            'Reuse variables where possible',
+                            'Split complex shaders into multiple passes',
+                            'Use fewer temporary values in calculations'
+                        ]
+                    });
+                }
+                
+                let html = '';
+                suggestions.forEach(s => {
+                    html += `
+                        <div style="margin-bottom: 20px; padding: 12px; background: #fff; border: 1px solid #ddd;">
+                            <div style="font-weight: 600; margin-bottom: 8px; color: #333;">
+                                ${s.title} <span style="color: #666; font-weight: normal; font-size: 12px;">(${s.count} dispatches)</span>
+                            </div>
+                            <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #666; line-height: 1.8;">
+                                ${s.tips.map(tip => `<li>${tip}</li>`).join('')}
+                            </ul>
+                        </div>
+                    `;
+                });
+                
+                suggestionsDiv.innerHTML = html;
+            }
+        }
+
+        // Initialize profiler UI
+        updateProfilingUI();
+    </script>
+</body>
+</html>

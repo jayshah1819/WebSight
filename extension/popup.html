@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            width: 400px;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            background: #1a202c;
+            color: #e2e8f0;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            text-align: center;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            color: white;
+        }
+
+        .header p {
+            margin: 5px 0 0 0;
+            font-size: 0.85rem;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 15px;
+        }
+
+        .status {
+            background: #2d3748;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            margin-bottom: 8px;
+        }
+
+        .status-active {
+            color: #48bb78;
+        }
+
+        .status-inactive {
+            color: #fc8181;
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 10px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+
+        .btn-secondary {
+            background: #4a5568;
+            color: white;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .stats {
+            background: #2d3748;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            border-bottom: 1px solid #4a5568;
+        }
+
+        .stat-item:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            color: #a0aec0;
+            font-size: 0.85rem;
+        }
+
+        .stat-value {
+            color: #e2e8f0;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+
+        .info {
+            background: #2c5282;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            line-height: 1.4;
+            color: #bee3f8;
+        }
+
+        .info strong {
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1> WebGPU Profiler</h1>
+        <p>Real-time GPU compute analysis</p>
+    </div>
+
+    <div class="content">
+        <div class="status">
+            <div id="statusIndicator" class="status-indicator status-inactive">
+                ⚫ Not Monitoring
+            </div>
+            <div id="statusMessage" style="font-size: 0.8rem; color: #a0aec0;">
+                Click "Start Profiling" to monitor WebGPU
+            </div>
+        </div>
+
+        <button id="startBtn" class="btn-primary"> Start Profiling</button>
+        <button id="stopBtn" class="btn-danger" disabled>⬛ Stop Profiling</button>
+
+        <div class="stats">
+            <h3 style="margin: 0 0 10px 0; font-size: 1rem;">Statistics</h3>
+            <div class="stat-item">
+                <span class="stat-label">Total Dispatches</span>
+                <span class="stat-value" id="totalDispatches">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Active Pipelines</span>
+                <span class="stat-value" id="activePipelines">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">GPU Bandwidth</span>
+                <span class="stat-value" id="gpuBandwidth">-</span>
+            </div>
+        </div>
+
+        <button id="exportBtn" class="btn-secondary"> Export Data</button>
+        <button id="clearBtn" class="btn-secondary">🗑 Clear Data</button>
+
+        <div class="info">
+            <strong>How to use:</strong><br>
+            1. Start profiling on this page<br>
+            2. Use the website normally<br>
+            3. WebGPU operations will be captured automatically<br>
+            4. Export data to view detailed analysis
+        </div>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html>
