@@ -262,8 +262,53 @@
 
         <!-- Kernel Timing Graphs (Dynamic) -->
         <div id="kernel-graphs"></div>
+
+        <!-- Advanced Analysis Section -->
+        <h2>Advanced Analysis</h2>
+        <div class="grid-3">
+            <div class="box">
+                <h2>Memory Leaks</h2>
+                <div id="memory-analysis" style="font-size: 14px;">
+                    <button onclick="runMemoryAnalysis()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px;">Run Analysis</button>
+                    <div id="memory-results"></div>
+                </div>
+            </div>
+            <div class="box">
+                <h2>Workgroup Optimization</h2>
+                <div id="workgroup-analysis" style="font-size: 14px;">
+                    <button onclick="runWorkgroupAnalysis()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px;">Run Analysis</button>
+                    <div id="workgroup-results"></div>
+                </div>
+            </div>
+            <div class="box">
+                <h2>Shader Complexity</h2>
+                <div id="shader-analysis" style="font-size: 14px;">
+                    <button onclick="runShaderAnalysis()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px;">Run Analysis</button>
+                    <div id="shader-results"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Test & Validation Section -->
+        <h2>Testing & Validation</h2>
+        <div class="grid-2">
+            <div class="box">
+                <h2>Run Tests</h2>
+                <button onclick="runTests()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px;">Run Test Suite</button>
+                <button onclick="validateWebSight()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px; margin-left: 10px;">Validate Features</button>
+                <div id="test-results" style="font-size: 12px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: monospace;"></div>
+            </div>
+            <div class="box">
+                <h2>Run Demo</h2>
+                <button onclick="runDemo()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px;">Run WebGPU Demo</button>
+                <button onclick="showFullReport()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px; margin-left: 10px;">Full Report</button>
+                <div id="demo-results" style="font-size: 12px; max-height: 300px; overflow-y: auto;"></div>
+            </div>
+        </div>
     </div>
 
+    <script src="test.js"></script>
+    <script src="validation.js"></script>
     <script>
         const profilerChannel = new BroadcastChannel('websight-profiler');
 
@@ -774,6 +819,186 @@
             WebSight.start();
         }
         updateUI();
+
+        // Advanced Analysis Functions
+        function runMemoryAnalysis() {
+            const report = WebSight.getMemoryLeaks();
+            const div = document.getElementById('memory-results');
+            
+            const leakCount = report.summary.totalLeaks;
+            const activeCount = report.summary.activeResources;
+            const currentMem = formatBytes(report.stats.currentMemory);
+            const peakMem = formatBytes(report.stats.peakMemory);
+            
+            div.innerHTML = `
+                <div style="margin-top: 10px;">
+                    <strong>Status: ${leakCount === 0 ? 'No Leaks' : leakCount + ' Potential Leaks'}</strong><br>
+                    Active Resources: ${activeCount}<br>
+                    Current Memory: ${currentMem}<br>
+                    Peak Memory: ${peakMem}<br>
+                    Leak Rate: ${report.summary.leakRate}<br>
+                    <br>
+                    ${leakCount > 0 ? '<strong>Top Leaks:</strong><br>' + 
+                        report.leaks.slice(0, 5).map(l => 
+                            `• ${l.type}: ${formatBytes(l.size)} (${formatTime(l.age)})`
+                        ).join('<br>') : ''}
+                </div>
+            `;
+        }
+
+        function runWorkgroupAnalysis() {
+            const analysis = WebSight.getWorkgroupAnalysis();
+            const div = document.getElementById('workgroup-results');
+            
+            if (!analysis.summary) {
+                div.innerHTML = '<div style="margin-top: 10px;">No dispatches to analyze yet.<br>Run some WebGPU code first.</div>';
+                return;
+            }
+            
+            const summary = analysis.summary;
+            const gradeColor = summary.grade === 'A' ? '#00aa00' : 
+                               summary.grade === 'B' ? '#88cc00' :
+                               summary.grade === 'C' ? '#ffaa00' : '#cc0000';
+            
+            div.innerHTML = `
+                <div style="margin-top: 10px;">
+                    <strong style="color: ${gradeColor};">Grade: ${summary.grade} (${summary.averageScore}/100)</strong><br>
+                    Kernels Analyzed: ${summary.totalKernels}<br>
+                    Critical Issues: ${summary.criticalIssues}<br>
+                    High Priority: ${summary.highIssues}<br>
+                    <br>
+                    ${summary.needsAttention.length > 0 ? 
+                        '<strong>Needs Attention:</strong><br>' +
+                        summary.needsAttention.slice(0, 3).map(a => 
+                            `• ${a.kernelId}: Score ${a.score}/100`
+                        ).join('<br>') : 
+                        'All workgroups optimized!'}
+                </div>
+            `;
+        }
+
+        function runShaderAnalysis() {
+            const analysis = WebSight.getShaderAnalysis();
+            const div = document.getElementById('shader-results');
+            
+            if (!analysis.summary) {
+                div.innerHTML = '<div style="margin-top: 10px;">No shaders to analyze yet.<br>Run some WebGPU code first.</div>';
+                return;
+            }
+            
+            const summary = analysis.summary;
+            const grade = summary.overallGrade;
+            const gradeColor = grade.letter === 'A' ? '#00aa00' : 
+                               grade.letter === 'B' ? '#88cc00' :
+                               grade.letter === 'C' ? '#ffaa00' : '#cc0000';
+            
+            div.innerHTML = `
+                <div style="margin-top: 10px;">
+                    <strong style="color: ${gradeColor};">Grade: ${grade.letter} (${summary.averageScore}/100)</strong><br>
+                    Shaders Analyzed: ${summary.totalShaders}<br>
+                    Avg Complexity: ${summary.averageComplexity}<br>
+                    Critical Issues: ${summary.criticalIssues}<br>
+                    <br>
+                    ${summary.needsOptimization.length > 0 ? 
+                        '<strong>Needs Optimization:</strong><br>' +
+                        summary.needsOptimization.slice(0, 3).map(a => 
+                            `• Score ${a.score}/100: ${a.issues.length} issues`
+                        ).join('<br>') : 
+                        'All shaders optimized!'}
+                </div>
+            `;
+        }
+
+        async function runTests() {
+            const div = document.getElementById('test-results');
+            div.innerHTML = 'Running tests...\n';
+            
+            // Capture console output
+            const oldLog = console.log;
+            let output = '';
+            console.log = function(...args) {
+                output += args.join(' ') + '\n';
+                oldLog.apply(console, args);
+            };
+            
+            if (typeof runWebSightTests === 'function') {
+                await runWebSightTests();
+            } else {
+                output = 'Test suite not loaded. Make sure test.js is included.';
+            }
+            
+            console.log = oldLog;
+            div.innerHTML = output;
+        }
+
+        async function validateWebSight() {
+            const div = document.getElementById('test-results');
+            div.innerHTML = 'Running validation...\n';
+            
+            // Capture console output
+            const oldLog = console.log;
+            let output = '';
+            console.log = function(...args) {
+                output += args.join(' ') + '\n';
+                oldLog.apply(console, args);
+            };
+            
+            if (typeof window.validateWebSight === 'function') {
+                await window.validateWebSight();
+            } else {
+                output = ' Validation suite not loaded. Make sure validation.js is included.';
+            }
+            
+            console.log = oldLog;
+            div.innerHTML = output;
+        }
+
+        async function runDemo() {
+            const div = document.getElementById('demo-results');
+            div.innerHTML = 'Running demo...<br>';
+            
+            if (typeof runWebSightDemo === 'function') {
+                await runWebSightDemo();
+                div.innerHTML += 'Demo completed! Check console for details.<br>';
+                div.innerHTML += 'Run analyses above to see results.';
+            } else {
+                div.innerHTML = 'Demo not loaded. Make sure validation.js is included.';
+            }
+        }
+
+        function showFullReport() {
+            const div = document.getElementById('demo-results');
+            const report = WebSight.getFullAnalysisReport();
+            
+            div.innerHTML = `
+                <strong>Full Analysis Report</strong><br>
+                <br>
+                <strong>Memory:</strong><br>
+                • Current: ${formatBytes(report.memory.stats.currentMemory)}<br>
+                • Peak: ${formatBytes(report.memory.stats.peakMemory)}<br>
+                • Leaks: ${report.memory.summary.totalLeaks}<br>
+                <br>
+                ${report.workgroup ? `
+                    <strong>Workgroup:</strong><br>
+                    • Grade: ${report.workgroup.grade}<br>
+                    • Kernels: ${report.workgroup.totalKernels}<br>
+                    • Issues: ${report.workgroup.criticalIssues} critical<br>
+                    <br>
+                ` : ''}
+                ${report.shader ? `
+                    <strong>Shader:</strong><br>
+                    • Grade: ${report.shader.overallGrade.letter}<br>
+                    • Shaders: ${report.shader.totalShaders}<br>
+                    • Issues: ${report.shader.criticalIssues} critical<br>
+                ` : ''}
+            `;
+        }
+
+        function formatTime(ms) {
+            if (ms < 1000) return ms + 'ms';
+            if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+            return (ms / 60000).toFixed(1) + 'min';
+        }
     </script>
 </body>
 </html>
