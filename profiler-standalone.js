@@ -1,4 +1,6 @@
-// WebGPU Compute Profiler
+// WebGPU Performance Profiler
+// Hooks into WebGPU API to capture GPU timing, pipeline usage, memory allocations,
+// and dispatch statistics. Broadcasts profiler data via BroadcastChannel for real-time visualization.
 
 (function() {
   'use strict';
@@ -9,7 +11,6 @@
     }
   }
 
-  // Handles GPU timestamp queries for accurate timing measurements
   class TimingHelper {
     #canTimestamp;
     #device;
@@ -44,19 +45,34 @@
         if (this.#querySet) {
           this.#querySet.destroy();
         }
-        this.#querySet = this.#device.createQuerySet({
-          type: "timestamp",
-          label: `TimingHelper query set buffer of count ${numKernels * 2}`,
-          count: numKernels * 2,
-        });
+        try {
+          this.#device.pushErrorScope('validation');
+          this.#querySet = this.#device.createQuerySet({
+            type: "timestamp",
+            label: `TimingHelper query set buffer of count ${numKernels * 2}`,
+            count: numKernels * 2,
+          });
+          this.#device.popErrorScope().then(error => {
+            if (error) {
+              console.warn(`[WebSight] QuerySet creation failed: ${error.message}`);
+              this.#canTimestamp = false;
+              this.#querySet = null;
+            }
+          });
+        } catch (e) {
+          this.#canTimestamp = false;
+          throw new Error(`Failed to create QuerySet: ${e.message}`);
+        }
         if (this.#resolveBuffer) {
           this.#resolveBuffer.destroy();
         }
-        this.#resolveBuffer = this.#device.createBuffer({
-          size: this.#querySet.count * 8,
-          label: `TimingHelper resolve buffer of count ${this.#querySet.count}`,
-          usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-        });
+        if (this.#querySet) {
+          this.#resolveBuffer = this.#device.createBuffer({
+            size: this.#querySet.count * 8,
+            label: `TimingHelper resolve buffer of count ${this.#querySet.count}`,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+          });
+        }
       }
     }
 
@@ -69,13 +85,12 @@
     }
 
     #beginTimestampPass(encoder, fnName, descriptor) {
-      if (this.#canTimestamp) {
+      if (this.#canTimestamp && this.#querySet) {
         assert(
           this.#state === "free" || this.#state == "in progress",
           `state not free (state = ${this.#state})`
         );
 
-        // Inject timestamp writes into pass descriptor
         const pass = encoder[fnName]({
           ...descriptor,
           ...{
@@ -94,7 +109,6 @@
           this.#state = "in progress";
         }
 
-        // Hook pass.end() to auto-resolve timing
         const resolve = () => this.#resolveTiming(encoder);
         pass.end = (function (origFn) {
           return function () {
@@ -163,6 +177,7 @@
         `must call resolveTiming (state === ${this.#state})`
       );
       this.#state = "free";
+
       this.#passNumber = 0;
 
       const resultBuffer = this.#resultBuffer;
@@ -210,18 +225,23 @@
     activeEncoders: new WeakMap(),
     config: {
       broadcastEnabled: true,
-      broadcastDebounceMs: 100,
+      broadcastDebounceMs: 5000,
       normalizeTimeUnit: 'us',
+      
+      verboseLogging: false,
+      
+      minimalOverhead: false,
+      
       enableMemoryLeakDetection: false,
       enableWorkgroupAnalysis: false,
       enableShaderAnalysis: false,
       captureStacks: false,
+      
       memoryLeakThresholdMs: 10000,
       memoryWarningThresholdMB: 100
     }
   };
 
-  // Tracks WebGPU resources to detect memory leaks
   class MemoryLeakDetector {
     constructor() {
       this.resources = new Map();
@@ -229,6 +249,7 @@
       this.leakThreshold = 10000;
       this.sizeThreshold = 100 * 1024 * 1024;
       this.autoCheckInterval = null;
+      
       this.stats = {
         totalAllocated: 0,
         totalFreed: 0,
@@ -256,6 +277,7 @@
     trackResource(resource, type, size) {
       const id = this.nextId++;
       const now = Date.now();
+      
       let stack = '';
       if (profilerData.config.captureStacks) {
         try {
@@ -284,6 +306,7 @@
       }
       
       resource.__websight_id = id;
+      
       return id;
     }
     
@@ -385,7 +408,7 @@
         stats: this.stats,
         leaks: leaks.sort((a, b) => b.size - a.size),
         active: active.sort((a, b) => b.size - a.size),
-        destroyed: destroyed.sort((a, b) => b.lifetime - a.lifetime).slice(0, 100),
+        destroyed: destroyed.sort((a, b) => b.lifetime - a.lifetime).slice(0, 100), // Top 100
         summary: {
           totalLeaks: leaks.length,
           leakedMemory: leaks.reduce((sum, l) => sum + l.size, 0),
@@ -412,15 +435,15 @@
     }
   }
 
-  // Analyzes workgroup sizes for optimal GPU occupancy
   class WorkgroupOccupancyAnalyzer {
     constructor() {
       this.deviceLimits = null;
-      this.analyses = new Map();
+      this.analyses = new Map(); // kernelId -> analysis
     }
     
     setDeviceLimits(limits) {
       this.deviceLimits = limits;
+      
       this.optimal = {
         simdWidth: 64,
         sharedMemoryPerWorkgroup: 32 * 1024,
@@ -447,12 +470,13 @@
         totalWorkgroups: dispatchSize[0] * dispatchSize[1] * dispatchSize[2],
         totalInvocations: 0,
         issues: [],
-        score: 100,
+        score: 100, // Start at 100, deduct for issues
         recommendations: []
       };
       
       analysis.totalInvocations = analysis.totalThreads * analysis.totalWorkgroups;
       
+      // Issue 1: Workgroup size not multiple of SIMD width
       if (analysis.totalThreads % this.optimal.simdWidth !== 0) {
         const wastedThreads = this.optimal.simdWidth - (analysis.totalThreads % this.optimal.simdWidth);
         const efficiency = ((analysis.totalThreads / (analysis.totalThreads + wastedThreads)) * 100).toFixed(1);
@@ -563,18 +587,27 @@
     }
   }
 
-  // Analyzes WGSL shader code for performance issues
   class ShaderComplexityAnalyzer {
     constructor() {
       this.analyses = new Map();
-      // Estimated cycle costs for various operations
+      
       this.instructionCosts = {
         'sqrt': 8, 'rsqrt': 8, 'sin': 16, 'cos': 16, 'tan': 16,
-        'exp': 12, 'exp2': 12, 'log': 12, 'log2': 12, 'pow': 16, 'atan': 16, 'atan2': 16,
+        'exp': 12, 'exp2': 12, 'log': 12, 'log2': 12,
+        'pow': 16, 'atan': 16, 'atan2': 16,
+        
         'textureSample': 20, 'textureLoad': 10, 'textureStore': 10,
-        'atomicAdd': 15, 'atomicSub': 15, 'atomicMax': 15, 'atomicMin': 15, 'atomicAnd': 15, 'atomicOr': 15,
-        'if': 2, 'else': 1, 'for': 3, 'while': 3, 'loop': 3, 'switch': 4, 'break': 1, 'continue': 1, 'return': 1,
+        'atomicAdd': 15, 'atomicSub': 15, 'atomicMax': 15,
+        'atomicMin': 15, 'atomicAnd': 15, 'atomicOr': 15,
+        
+        // Control flow
+        'if': 2, 'else': 1, 'for': 3, 'while': 3, 'loop': 3,
+        'switch': 4, 'break': 1, 'continue': 1, 'return': 1,
+        
+        // Memory operations
         'load': 4, 'store': 4,
+        
+        // Cheap operations
         'add': 1, 'sub': 1, 'mul': 1, 'div': 2,
         'select': 1, 'clamp': 1, 'min': 1, 'max': 1
       };
@@ -726,6 +759,7 @@
       analysis.complexity = this.calculateComplexity(analysis);
       analysis.grade = this.getGrade(analysis.score);
       
+      // Estimate potential speedup
       if (analysis.issues.length > 0) {
         const highSeverity = analysis.issues.filter(i => i.severity === 'critical' || i.severity === 'high');
         if (highSeverity.length > 0) {
@@ -744,6 +778,8 @@
     findDivergentBranches(code) {
       const branches = [];
       const lines = code.split('\n');
+      
+      // Look for if statements inside loops
       let inLoop = false;
       let loopDepth = 0;
       
@@ -788,7 +824,9 @@
     }
     
     countVariables(code) {
-      return (code.match(/\b(var|let)\s+\w+/g) || []).length;
+      // Count 'var' and 'let' declarations
+      const vars = (code.match(/\b(var|let)\s+\w+/g) || []).length;
+      return vars;
     }
     
     findUncoalescedAccess(code) {
@@ -796,6 +834,7 @@
       const lines = code.split('\n');
       
       lines.forEach((line, idx) => {
+        // Look for array[expression * stride] patterns
         if (/\[\s*\w+\s*\*\s*\d+\s*\]/.test(line)) {
           patterns.push({
             line: idx + 1,
@@ -804,6 +843,7 @@
           });
         }
         
+        // Look for indirect indexing
         if (/\[\s*\w+\[\w+\]\s*\]/.test(line)) {
           patterns.push({
             line: idx + 1,
@@ -861,9 +901,15 @@
     }
     
     calculateComplexity(analysis) {
-      return (analysis.metrics.branches * 3 + analysis.metrics.loops * 5 + 
-              analysis.metrics.mathOps * 2 + analysis.metrics.memoryOps * 4 + 
-              analysis.metrics.atomicOps * 5 + analysis.metrics.registerPressure * 0.5);
+      // Weighted complexity score
+      return (
+        analysis.metrics.branches * 3 +
+        analysis.metrics.loops * 5 +
+        analysis.metrics.mathOps * 2 +
+        analysis.metrics.memoryOps * 4 +
+        analysis.metrics.atomicOps * 5 +
+        analysis.metrics.registerPressure * 0.5
+      );
     }
     
     getGrade(score) {
@@ -896,21 +942,44 @@
     }
   }
 
+  // Initialize analyzers
   const memoryLeakDetector = new MemoryLeakDetector();
   const workgroupAnalyzer = new WorkgroupOccupancyAnalyzer();
   const shaderAnalyzer = new ShaderComplexityAnalyzer();
+  
+  // Helper functions for conditional logging
+  function log(...args) {
+    if (profilerData.config.verboseLogging) {
+      console.log(...args);
+    }
+  }
+  
+  function warn(...args) {
+    if (profilerData.config.verboseLogging) {
+      console.warn(...args);
+    }
+  }
+  
+  function error(...args) {
+    console.error(...args);
+  }
 
-  // Broadcast channel for sending data to extension/UI
   const profilerChannel = new BroadcastChannel('websight-profiler');
   let broadcastTimer = null;
 
   function broadcastData() {
-    if (!profilerData.config.broadcastEnabled) return;
+    if (window.__webSightIsUIWindow) {
+      return;
+    }
+    
+    if (!profilerData.config.broadcastEnabled) {
+      return;
+    }
     if (broadcastTimer) return;
     
     broadcastTimer = setTimeout(() => {
       try {
-        profilerChannel.postMessage({
+        const payload = {
           type: 'profiler-update',
           data: {
             dispatches: profilerData.dispatches,
@@ -921,9 +990,12 @@
             gpuCharacteristics: profilerData.gpuCharacteristics,
             runs: profilerData.runs,
             runId: profilerData.runId,
+            timingMode: profilerData.timingMode,  // Add timing mode
+            sessionStart: profilerData.sessionStart,
             timestamp: Date.now()
           }
-        });
+        };
+        profilerChannel.postMessage(payload);
       } catch (e) {
         console.error('[WebSight] Broadcast failed:', e);
       }
@@ -943,10 +1015,14 @@
 
   function getTimeUnitLabel() {
     const unit = profilerData.config.normalizeTimeUnit;
-    return unit === 'ns' ? 'ns' : unit === 'ms' ? 'ms' : 'µs';
+    switch (unit) {
+      case 'ns': return 'ns';
+      case 'us': return 'µs';
+      case 'ms': return 'ms';
+      default: return 'µs';
+    }
   }
 
-  // Simple string hash for generating IDs
   function hashString(str) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
@@ -986,6 +1062,7 @@
       estimatedRegisters: 0, 
       sharedMemorySize: 0 
     };
+
     if (source.match(/atomic(Add|Sub|Max|Min|And|Or|Xor|Exchange|CompareExchange)/)) {
       metrics.hasAtomics = true;
       warnings.push({ 
@@ -1012,11 +1089,13 @@
       message, 
       time: Date.now() 
     });
-    console.log(`[WebSight] ${message}`);
+    // Only log to console if verbose logging is enabled
+    if (profilerData.config.verboseLogging) {
+      console.log(`[WebSight] ${message}`);
+    }
     broadcastData();
   }
 
-  // Main WebGPU API hooking function
   async function hookWebGPU() {
     if (!navigator.gpu) {
       addLog('WebGPU not available', 'error');
@@ -1037,6 +1116,8 @@
       if (!adapter) return adapter;
 
       const hasTimestampFeature = adapter.features.has('timestamp-query');
+      
+      // Track this adapter
       const adapterInfo = {
         adapter,
         hasTimestampFeature,
@@ -1053,6 +1134,7 @@
       adapter.requestDevice = async function(descriptor) {
         try {
           const requiredFeatures = new Set(descriptor?.requiredFeatures || []);
+          
           if (hasTimestampFeature) {
             requiredFeatures.add('timestamp-query');
           }
@@ -1065,7 +1147,9 @@
           const device = await originalRequestDevice(modifiedDescriptor);
           
           const hasTimestampQuery = device.features.has('timestamp-query');
-          profilerData.timingMode = hasTimestampQuery ? 'gpu' : 'cpu-only';
+          
+          const shouldUseGPUTiming = (window.__webSightDisableGPUTiming !== true) && hasTimestampQuery;
+          profilerData.timingMode = shouldUseGPUTiming ? 'gpu' : 'cpu-only';
           
           const deviceInfo = {
             device,
@@ -1075,26 +1159,48 @@
             label: descriptor?.label || `device_${window.__webSightDevices.length + 1}`,
             features: Array.from(device.features),
             limits: { ...device.limits },
-            timingMode: hasTimestampQuery ? 'gpu' : 'cpu-only',
+            timingMode: profilerData.timingMode, // Use same value as profilerData
             encoderCount: 0,
             passCount: 0,
             dispatchCount: 0
           };
           window.__webSightDevices.push(deviceInfo);
           adapterInfo.devices.push(deviceInfo);
+          
+          // Add uncaptured error handler to catch QuerySet allocation failures
+          device.addEventListener('uncapturederror', (event) => {
+            if (event.error.message && event.error.message.includes('Cannot allocate sample buffer')) {
+              console.error('[WebSight] GPU QuerySet allocation failed!');
+              console.log('[WebSight] Your GPU has reached its QuerySet limit.');
+        
+              console.log('[WebSight]   <script>window.__webSightDisableGPUTiming = true;</script>');
+              // Automatically disable GPU timing for this device
+              deviceInfo.timingMode = 'cpu-only';
+              profilerData.timingMode = 'cpu-only';
+            }
+          });
+          
+          // Store device reference on the device object itself for easy lookup
           device.__webSightInfo = deviceInfo;
           
           addLog(`Device ${window.__webSightDevices.length} created - Timing: ${profilerData.timingMode}, Label: ${deviceInfo.label}`);
 
+          // Hook createShaderModule
           const origCreateShaderModule = device.createShaderModule.bind(device);
           device.createShaderModule = function(desc) {
             const module = origCreateShaderModule(desc);
             const shaderId = crypto.randomUUID();
+            
             module.__source = desc.code;
             module.__shaderId = shaderId;
+            
+            // Store shader code for on-demand analysis
+            // Don't analyze automatically 
+            
             return module;
           };
 
+          // Hook createComputePipeline
           const origCreateComputePipeline = device.createComputePipeline.bind(device);
           device.createComputePipeline = function(desc) {
             const pipeline = origCreateComputePipeline(desc);
@@ -1128,6 +1234,41 @@
             return pipeline;
           };
 
+          // Hook createComputePipelineAsync
+          const origCreateComputePipelineAsync = device.createComputePipelineAsync.bind(device);
+          device.createComputePipelineAsync = async function(desc) {
+            const pipeline = await origCreateComputePipelineAsync(desc);
+            const source = desc.compute.module.__source || '';
+            const workgroupSize = extractWorkgroupSize(source);
+            const label = desc.label || 'compute_pipeline_async';
+            
+            pipeline.__capture = {
+              id: crypto.randomUUID(),
+              label: label,
+              workgroupSize: workgroupSize,
+              shader: source,
+              shaderId: desc.compute.module.__shaderId,
+              analysis: analyzeWGSL(source)
+            };
+            
+            profilerData.pipelines[pipeline.__capture.id] = pipeline.__capture;
+            
+            const kernelId = generateKernelId(source, workgroupSize, label);
+            if (!profilerData.kernels[kernelId]) {
+              profilerData.kernels[kernelId] = {
+                id: kernelId,
+                label: label,
+                workgroupSize: workgroupSize,
+                shader: source,
+                shaderId: desc.compute.module.__shaderId,
+                stats: { count: 0, totalTime: 0, avgTime: 0, minTime: Infinity, maxTime: 0 }
+              };
+            }
+            
+            return pipeline;
+          };
+
+          // Hook createBuffer
           const origCreateBuffer = device.createBuffer.bind(device);
           device.createBuffer = function(desc) {
             const buffer = origCreateBuffer(desc);
@@ -1141,8 +1282,10 @@
             };
             profilerData.buffers[bufferId] = buffer.__capture;
             
+            // Track for memory leak detection
             memoryLeakDetector.trackResource(buffer, 'GPUBuffer', desc.size);
             
+            // Hook destroy method
             const origDestroy = buffer.destroy.bind(buffer);
             buffer.destroy = function() {
               memoryLeakDetector.markDestroyed(buffer);
@@ -1152,6 +1295,7 @@
             return buffer;
           };
 
+          // Hook createBindGroup
           const origCreateBindGroup = device.createBindGroup.bind(device);
           device.createBindGroup = function(desc) {
             const bg = origCreateBindGroup(desc);
@@ -1164,45 +1308,72 @@
             return bg;
           };
 
+          // Global timing accumulator for exposing to BasePrimitive.__timingHelper interface
+          // This accumulates ALL pass timings across all encoders in current execution
           if (!window.__webSightGlobalTimingResults) {
             window.__webSightGlobalTimingResults = [];
-            window.__webSightMaxTimingResults = 10000;
+            window.__webSightMaxTimingResults = 10000; 
           }
           
+
+          // WebGPU limit: Varies by GPU (typically 30-60 QuerySets on integrated GPUs)
+          // Each TimingHelper uses 1 QuerySet with 2 timestamps (begin/end)
+          // Strategy: Create helpers up to GPU limit, then WAIT for completion before reuse
           if (!window.__webSightTimingHelperPools) {
-            window.__webSightTimingHelperPools = new Map();
+            window.__webSightTimingHelperPools = new Map(); // Per-device pools
           }
           
-          // Pool timing helpers per device to avoid QuerySet exhaustion
           const getTimingHelper = (device) => {
+            // Get or create pool for this device
             if (!window.__webSightTimingHelperPools.has(device)) {
               window.__webSightTimingHelperPools.set(device, {
                 helpers: [],
-                available: [],
-                inUse: new Set(),
+                available: [], // Queue of helpers ready to use
+                inUse: new Set(), // Helpers currently in use
                 index: 0,
-                maxSize: 24,
-                passesPerHelper: 1,
-                failed: false,
-                limitReached: false
+                maxSize: 1, // Ultra-conservative: only 1 TimingHelper to avoid GPU QuerySet limits
+                passesPerHelper: 1, // 1 pass per helper = most reliable for rapid single-pass operations
+                failed: false, // Track if timing completely unavailable
+                limitReached: false // Track if we've hit the GPU QuerySet limit
               });
             }
             
             const pool = window.__webSightTimingHelperPools.get(device);
             
+            // If timing previously failed completely, don't keep trying
             if (pool.failed) {
               return null;
             }
             
+            // If we have available helpers in queue, use those first
             if (pool.available.length > 0) {
               const helper = pool.available.shift();
               pool.inUse.add(helper);
               return helper;
             }
             
+            // If we haven't hit the limit yet, try to create new helper WITH GPU-level validation
             if (pool.helpers.length < pool.maxSize && !pool.limitReached) {
               try {
+                // Push error scope BEFORE creating TimingHelper to catch GPU-level failures
+                device.pushErrorScope('validation');
                 const helper = new TimingHelper(device, pool.passesPerHelper);
+                
+                // Check for GPU-level errors synchronously-ish
+                device.popErrorScope().then(error => {
+                  if (error) {
+                    // GPU rejected the QuerySet - mark pool as failed
+                    console.error('[WebSight]  GPU QuerySet creation failed:', error.message);
+                    pool.limitReached = true;
+                    pool.failed = true;
+                    // Remove the failed helper from pool
+                    const idx = pool.helpers.indexOf(helper);
+                    if (idx >= 0) pool.helpers.splice(idx, 1);
+                    pool.inUse.delete(helper);
+                  }
+                });
+                
+                // Only add to pool if creation succeeded (no exception thrown)
                 pool.helpers.push(helper);
                 pool.inUse.add(helper);
                 if (pool.helpers.length <= 5 || pool.helpers.length % 10 === 0) {
@@ -1213,13 +1384,17 @@
                 if (e.message.includes('Cannot allocate') || e.message.includes('sample buffer') || e.message.includes('QuerySet')) {
                   pool.limitReached = true;
                   console.warn(`[WebSight] GPU QuerySet limit reached at ${pool.helpers.length} helpers.`);
-                  console.log(`[WebSight] Max concurrent timing operations: ${pool.helpers.length}. Additional operations will wait for available helpers.`);
+                  console.warn(`[WebSight] Your GPU cannot allocate more QuerySets for timestamp queries.`);
+                  console.log(`[WebSight] Workaround: Add "window.__webSightDisableGPUTiming = true;" before loading profiler-standalone.js`);
                   
                   if (pool.helpers.length === 0) {
                     pool.failed = true;
-                    console.error('[WebSight] GPU timing completely unavailable. Profiler will continue without GPU timestamps.');
+                    console.error('[WebSight] GPU timing completely unavailable. Profiler will continue without CPU timestamps.');
+                    console.log(`[WebSight] Falling back to CPU timing. Set window.__webSightDisableGPUTiming = true to suppress this error.`);
+                    profilerData.timingMode = 'cpu-only';
                     return null;
                   }
+                  console.log(`[WebSight] Max concurrent timing operations: ${pool.helpers.length}. Render passes will continue without timing until helpers become available.`);
                   return null;
                 } else {
                   console.warn('[WebSight] Cannot create TimingHelper:', e.message);
@@ -1240,10 +1415,10 @@
               pool.index++;
             }
             
-            return null;
+            return null; // No available helpers - caller handles graceful degradation
           };
           
-          // Release helper back to pool for reuse
+          // Helper function to release a TimingHelper back to the pool after use
           const releaseTimingHelper = (device, helper) => {
             const pool = window.__webSightTimingHelperPools.get(device);
             if (!pool || !helper) return;
@@ -1252,6 +1427,7 @@
             pool.available.push(helper);
           };
           
+          // Hook createCommandEncoder
           const origCreateCommandEncoder = device.createCommandEncoder.bind(device);
           device.createCommandEncoder = function(desc) {
             const encoder = origCreateCommandEncoder(desc);
@@ -1259,29 +1435,38 @@
             const origBeginRenderPass = encoder.beginRenderPass.bind(encoder);
             const origFinish = encoder.finish.bind(encoder);
 
+            // Track encoder creation for multi-GPU statistics
             device.__webSightInfo.encoderCount++;
 
+            // Track encoder lifetime
             const encoderData = {
               dispatches: [],
               startTime: performance.now(),
               id: crypto.randomUUID(),
-              passCount: 0,
-              device: device,
+              passCount: 0, // Count passes for this encoder
+              device: device, // Store device reference
               deviceLabel: device.__webSightInfo.label
             };
             profilerData.activeEncoders.set(encoder, encoderData);
 
+            // Create NEW TimingHelper for THIS encoder (like primitive.mjs does)
+            // We don't know how many passes in advance, so start with 1 and adjust per pass
             let encoderTimingHelper = null;
-            let passTimings = [];
+            let passTimings = []; // Collect pass timings manually
             
-            if (profilerData.timingMode === 'gpu') {
+            // Skip GPU timing in minimal overhead mode
+            if (profilerData.timingMode === 'gpu' && !profilerData.config.minimalOverhead) {
               try {
+                // Don't use TimingHelper - it requires exact kernel count up front
+                // Instead, track passes manually
                 console.log(`[WebSight] GPU timing enabled for encoder "${desc?.label || 'unlabeled'}"`);
               } catch (e) {
                 console.error(`[WebSight] GPU timing setup failed: ${e.message}`);
               }
             }
 
+            // Create a proxy encoder with ORIGINAL beginComputePass for TimingHelper
+            // Also include resolveQuerySet and copyBufferToBuffer which are used by #resolveTiming
             const proxyEncoder = {
               beginComputePass: origBeginComputePass,
               beginRenderPass: origBeginRenderPass,
@@ -1290,37 +1475,44 @@
             };
 
             encoder.beginComputePass = function(passDesc) {
+              // Get or reuse a TimingHelper from pool (instead of creating unlimited new ones)
               let passTimingHelper = null;
               if (profilerData.timingMode === 'gpu') {
                 passTimingHelper = getTimingHelper(device);
                 if (passTimingHelper) {
                   passTimings.push(passTimingHelper);
                 }
+                // No error logging here - getTimingHelper already handles that
               }
               
+              // Use TimingHelper's beginComputePass on PROXY encoder (prevents recursion)
+              // If no timing helper available, just use original pass (graceful degradation)
               let pass;
               if (passTimingHelper) {
                 try {
                   pass = passTimingHelper.beginComputePass(proxyEncoder, passDesc);
                 } catch (e) {
+                  // If beginComputePass fails (e.g., invalid QuerySet), fall back to regular pass
                   console.warn('[WebSight] TimingHelper.beginComputePass failed, continuing without timing:', e.message);
                   pass = origBeginComputePass(passDesc);
-                  passTimingHelper = null;
-                  passTimings.pop();
+                  passTimingHelper = null; // Don't track this failed helper
+                  passTimings.pop(); // Remove from passTimings array
                 }
               } else {
                 pass = origBeginComputePass(passDesc);
               }
               
-            encoderData.passCount++;
-            device.__webSightInfo.passCount++;
-            
-            pass.__dispatches = [];
-            pass.__boundPipeline = null;
-            pass.__boundBindGroups = {};
-            pass.__timingHelper = passTimingHelper;
-            pass.__passType = 'compute';
-            pass.__deviceLabel = device.__webSightInfo.label;              const origSetPipeline = pass.setPipeline.bind(pass);
+              encoderData.passCount++;
+              device.__webSightInfo.passCount++; // Track per-device
+              
+              pass.__dispatches = [];
+              pass.__boundPipeline = null;
+              pass.__boundBindGroups = {};
+              pass.__timingHelper = passTimingHelper; // Store on pass for later
+              pass.__passType = 'compute';
+              pass.__deviceLabel = device.__webSightInfo.label;
+
+              const origSetPipeline = pass.setPipeline.bind(pass);
               pass.setPipeline = function(p) {
                 this.__boundPipeline = p;
                 origSetPipeline(p);
@@ -1342,7 +1534,6 @@
                   return;
                 }
 
-                // Generate stable kernel ID from shader + workgroup config
                 const kernelId = generateKernelId(
                   pipeline.shader, 
                   pipeline.workgroupSize, 
@@ -1377,7 +1568,7 @@
                   cpuTimeNs: cpuTimeNs,
                   cpuTimeUs: cpuTimeNs / 1000,
                   cpuTimeMs: cpuTimeMs,
-                  gpuTimeNs: cpuTimeNs,
+                  gpuTimeNs: cpuTimeNs, // Default to CPU time
                   gpuTimeUs: cpuTimeNs / 1000,
                   gpuTimeMs: cpuTimeMs,
                   timingSource: 'cpu_timing',
@@ -1385,7 +1576,7 @@
                   timeUnit: getTimeUnitLabel(),
                   timestampStart: -1,
                   timestampEnd: -1,
-                  deviceLabel: device.__webSightInfo.label,
+                  deviceLabel: device.__webSightInfo.label, // Multi-GPU tracking
                   passType: 'compute',
                   bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
                     bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
@@ -1416,7 +1607,7 @@
                 profilerData.dispatches.push(dispatchRecord);
                 pass.__dispatches.push(dispatchRecord);
                 encoderData.dispatches.push(dispatchRecord);
-                device.__webSightInfo.dispatchCount++;
+                device.__webSightInfo.dispatchCount++; // Track per-device
 
                 dispatchRecord.bufferAccesses.forEach(b => {
                   if (b?.id) {
@@ -1430,38 +1621,46 @@
               return pass;
             };
 
+            // Hook beginRenderPass for graphical applications (same timing strategy as compute)
             encoder.beginRenderPass = function(passDesc) {
               try {
+                // Get or reuse a TimingHelper from pool
                 let passTimingHelper = null;
                 if (profilerData.timingMode === 'gpu') {
                   passTimingHelper = getTimingHelper(device);
                   if (passTimingHelper) {
                     passTimings.push(passTimingHelper);
                   }
+                  // No error logging here - getTimingHelper already handles that
                 }
 
+                // Use TimingHelper's beginRenderPass on PROXY encoder (prevents recursion)
+                // If no timing helper available, just use original pass (graceful degradation)
                 let pass;
                 if (passTimingHelper) {
                   try {
                     pass = passTimingHelper.beginRenderPass(proxyEncoder, passDesc);
                   } catch (e) {
+                    // If beginRenderPass fails (e.g., invalid QuerySet), fall back to regular pass
                     console.warn('[WebSight] TimingHelper.beginRenderPass failed, continuing without timing:', e.message);
                     pass = origBeginRenderPass(passDesc);
-                    passTimingHelper = null;
-                    passTimings.pop();
+                    passTimingHelper = null; // Don't track this failed helper
+                    passTimings.pop(); // Remove from passTimings array
                   }
                 } else {
                   pass = origBeginRenderPass(passDesc);
                 }
                 
                 encoderData.passCount++;
-                device.__webSightInfo.passCount++;
+                device.__webSightInfo.passCount++; // Track per-device
 
                 pass.__dispatches = [];
                 pass.__boundBindGroups = {};
                 pass.__passType = 'render';
-                pass.__timingHelper = passTimingHelper;
+                pass.__timingHelper = passTimingHelper; // Store for later timing retrieval
                 pass.__deviceLabel = device.__webSightInfo.label;
+
+                // Track render pass operations (draw calls instead of dispatches)
                 const origSetPipeline = pass.setPipeline.bind(pass);
                 pass.setPipeline = function(p) {
                   this.__boundPipeline = p;
@@ -1474,6 +1673,7 @@
                   origSetBindGroup(i, bg);
                 };
 
+                // Track draw calls as "dispatches" for consistency
                 const origDraw = pass.draw.bind(pass);
                 pass.draw = function(vertexCount, instanceCount, firstVertex, firstInstance) {
                   const pipeline = this.__boundPipeline?.__capture;
@@ -1505,12 +1705,12 @@
                   
                   drawRecord.cpuEnd = performance.now();
                   drawRecord.cpuTimeNs = (drawRecord.cpuEnd - drawRecord.cpuStart) * 1000000;
-                  drawRecord.gpuTimeNs = drawRecord.cpuTimeNs;
+                  drawRecord.gpuTimeNs = drawRecord.cpuTimeNs; // Default to CPU time
 
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
                   encoderData.dispatches.push(drawRecord);
-                  device.__webSightInfo.dispatchCount++;
+                  device.__webSightInfo.dispatchCount++; // Track per-device
 
                   broadcastData();
                 };
@@ -1552,7 +1752,7 @@
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
                   encoderData.dispatches.push(drawRecord);
-                  device.__webSightInfo.dispatchCount++;
+                  device.__webSightInfo.dispatchCount++; // Track per-device
 
                   broadcastData();
                 };
@@ -1568,14 +1768,16 @@
               const commandBuffer = origFinish.call(this, descriptor);
               commandBuffer.__dispatches = encoderData.dispatches;
               commandBuffer.__encoderId = encoderData.id;
-              commandBuffer.__passTimings = passTimings;
+              commandBuffer.__passTimings = passTimings; // Store array of TimingHelpers (one per pass)
               commandBuffer.__passCount = encoderData.passCount;
               
+              // Method 3: Expose timing API on command buffer for universal access
               commandBuffer.__gpuTiming = {
                 available: false,
                 passes: [],
                 totalTimeNs: 0,
                 
+                // Promise that resolves when timing is ready
                 ready: new Promise((resolve) => {
                   commandBuffer.__gpuTimingResolve = resolve;
                 })
@@ -1587,9 +1789,11 @@
             return encoder;
           };
 
+          // Hook queue.submit
           const origSubmit = device.queue.submit.bind(device.queue);
           
           device.queue.submit = function(cmds) {
+            // Collect dispatches and timing helpers from command buffers
             let dispatchesInSubmit = [];
             let passTimingHelpers = [];
             
@@ -1604,16 +1808,18 @@
             
             const result = origSubmit(cmds);
             
-            // Retrieve GPU timing after submission completes
+            // Get GPU timing results AFTER submission completes
             if (passTimingHelpers.length > 0) {
+              // Track which command buffers we're timing
               const cmdBuffersWithTiming = cmds.filter(cmd => cmd.__gpuTiming);
               
               device.queue.onSubmittedWorkDone().then(async () => {
                 try {
+                  // Get results from each TimingHelper (each has 1 pass)
                   const allDurations = [];
                   for (const helper of passTimingHelpers) {
                     if (!helper) {
-                      allDurations.push(0n);
+                      allDurations.push(0n); // No helper was available
                       continue;
                     }
                     
@@ -1635,13 +1841,17 @@
                     console.log(`[WebSight] Got GPU timing for ${nonZeroCount}/${allDurations.length} passes:`, allDurations.map(d => `${(Number(d)/1000000).toFixed(3)}ms`));
                   }
                   
+                  // Accumulate ALL timings for Method 2 (direct access)
+                  // Add memory leak protection - limit total stored results
                   window.__webSightGlobalTimingResults.push(...allDurations);
                   if (window.__webSightGlobalTimingResults.length > window.__webSightMaxTimingResults) {
+                    // Keep only the most recent results
                     const excess = window.__webSightGlobalTimingResults.length - window.__webSightMaxTimingResults;
                     window.__webSightGlobalTimingResults.splice(0, excess);
                     console.warn(`[WebSight] Timing results buffer full (${window.__webSightMaxTimingResults}). Oldest ${excess} results discarded.`);
                   }
                   
+                  // Method 3: Populate command buffer timing
                   if (cmdBuffersWithTiming.length > 0) {
                     const totalTimeNs = allDurations.reduce((sum, t) => sum + Number(t), 0);
                     
@@ -1651,12 +1861,14 @@
                       cmd.__gpuTiming.totalTimeNs = totalTimeNs;
                       cmd.__gpuTiming.totalTimeMs = totalTimeNs / 1000000;
                       
+                      // Resolve the ready promise
                       if (cmd.__gpuTimingResolve) {
                         cmd.__gpuTimingResolve(cmd.__gpuTiming);
                       }
                     });
                   }
                   
+                  // Method 4: Fire timing event
                   if (window.__webSightTimingEvents) {
                     window.__webSightTimingEvents.dispatchEvent(new CustomEvent('timing', {
                       detail: {
@@ -1667,19 +1879,23 @@
                     }));
                   }
                   
+                  // Update dispatch records for profiler UI
                   if (dispatchesInSubmit.length > 0) {
                     for (let i = 0; i < Math.min(allDurations.length, dispatchesInSubmit.length); i++) {
                       const dispatch = dispatchesInSubmit[i];
                       const gpuTimeNs = Number(allDurations[i]);
                       
+                      // Update dispatch with GPU timing
                       dispatch.gpuTimeNs = gpuTimeNs;
                       dispatch.gpuTimeUs = gpuTimeNs / 1000;
                       dispatch.gpuTimeMs = gpuTimeNs / 1000000;
                       dispatch.normalizedTime = normalizeTime(gpuTimeNs);
                       dispatch.timingSource = 'gpu_timestamp';
                       
+                      // Update kernel stats
                       const kernel = profilerData.kernels[dispatch.kernelId];
                       if (kernel) {
+                        // Replace CPU time with GPU time in totals
                         kernel.stats.totalTime = (kernel.stats.totalTime - dispatch.cpuTimeNs) + gpuTimeNs;
                         kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
                         kernel.stats.minTime = Math.min(kernel.stats.minTime, gpuTimeNs);
@@ -1703,13 +1919,13 @@
           if (!window.__WebSightTimingHelper) {
             window.__webSightTimingHelper_executionId = 0;
             
-            // Expose timing API for external frameworks (e.g., primitive.mjs)
             window.__WebSightTimingHelper = {
               async getResult() {
                 const results = window.__webSightGlobalTimingResults || [];
-                const total = results.reduce((a,b) => a + Number(b), 0) / 1000000;
+                const total = results.reduce((a,b) => a + Number(b), 0) / 1000000; // Convert to ms
                 console.log(`[WebSight] Application requested timing: ${results.length} passes, ${total.toFixed(3)}ms total`);
                 
+                // Return copy and clear for next execution
                 const returnValue = [...results];
                 window.__webSightGlobalTimingResults = [];
                 
@@ -1721,9 +1937,14 @@
               }
             };
             
+            // Method 4: Event-based timing notifications (for real-time apps)
             window.__webSightTimingEvents = new EventTarget();
             
-            console.log('[WebSight] GPU Timing enabled');
+            log('[WebSight] GPU Timing enabled - Multiple access methods:');
+            log('  1. window.__WebSightTimingHelper.getResult() - for primitive.mjs');
+            log('  2. window.__webSightGlobalTimingResults - direct access array');
+            log('  3. commandBuffer.__gpuTiming - per-command timing');
+            log('  4. window.__webSightTimingEvents.addEventListener("timing") - events');
           }
 
           addLog('WebGPU hooks installed');
@@ -1738,7 +1959,6 @@
     };
   }
 
-  // Public API exposed on window.WebSight
   if (typeof window !== 'undefined') {
     window.WebSight = {
       getData: () => profilerData,
@@ -1792,6 +2012,7 @@
             return pools;
           })(),
           
+          // Aggregate statistics
           totals: {
             adapterCount: window.__webSightAdapters?.length || 0,
             deviceCount: window.__webSightDevices?.length || 0,
@@ -1806,11 +2027,13 @@
         profilerData.dispatches = []; 
         profilerData.logs = [];
         profilerData.kernels = {};
+        // Note: Each encoder has its own TimingHelper now
         addLog('Profiler cleared');
       },
       
       start: hookWebGPU,
       
+      // Configuration
       configure: (options) => {
         if (options.broadcastEnabled !== undefined) {
           profilerData.config.broadcastEnabled = options.broadcastEnabled;
@@ -1826,14 +2049,45 @@
           console.log(`[WebSight] Time unit: ${options.timeUnit}`);
         }
         
+        if (options.minimalOverhead !== undefined) {
+          profilerData.config.minimalOverhead = options.minimalOverhead;
+          if (options.minimalOverhead) {
+            // Disable GPU timing and increase broadcast interval
+            profilerData.timingMode = 'cpu';
+            profilerData.config.broadcastDebounceMs = 10000; // 10 seconds
+            console.log('[WebSight] ⚡ MINIMAL OVERHEAD MODE: GPU timing disabled, broadcast interval 10s');
+          } else {
+            profilerData.timingMode = 'gpu';
+            profilerData.config.broadcastDebounceMs = 1000;
+            console.log('[WebSight] Normal mode: GPU timing enabled, broadcast interval 1s');
+          }
+        }
+        
+        // Note: maxPasses and allowDynamicGrowth are now per-encoder, not global
+        
         return {
           broadcastEnabled: profilerData.config.broadcastEnabled,
           broadcastDebounceMs: profilerData.config.broadcastDebounceMs,
-          timeUnit: profilerData.config.normalizeTimeUnit
+          timeUnit: profilerData.config.normalizeTimeUnit,
+          minimalOverhead: profilerData.config.minimalOverhead
         };
       },
       
-      // Statistics
+      benchmarkMode: () => {
+        profilerData.config.minimalOverhead = true;
+        profilerData.timingMode = 'cpu';
+        profilerData.config.broadcastEnabled = false;
+        console.log('[WebSight] BENCHMARK MODE: Minimal overhead, no broadcasts, CPU timing only');
+      },
+      
+      normalMode: () => {
+        profilerData.config.minimalOverhead = false;
+        profilerData.timingMode = 'gpu';
+        profilerData.config.broadcastEnabled = true;
+        profilerData.config.broadcastDebounceMs = 1000;
+        console.log('[WebSight] NORMAL MODE: GPU timing enabled, broadcasts active');
+      },
+      
       getStats: () => {
         const dispatches = profilerData.dispatches || [];
         const validGpuTimes = dispatches
@@ -1892,7 +2146,13 @@
         addLog('Profile exported');
       },
       
+      // =========================================================================
+      // ADVANCED ANALYSIS API
+      // =========================================================================
+      
+      // Memory Leak Detection
       getMemoryLeaks: () => {
+        // Run leak check immediately before getting report
         memoryLeakDetector.checkForLeaks();
         
         const report = memoryLeakDetector.getLeakReport();
@@ -1924,9 +2184,12 @@
       
       getMemoryStats: () => memoryLeakDetector.stats,
       
+      // Workgroup Occupancy Analysis
       getWorkgroupAnalysis: () => {
-        console.log('\n[WebSight] Analyzing workgroup configurations...');
+        // Analyze all dispatches on-demand
+        console.log('\n⚙️ [WebSight] Analyzing workgroup configurations...');
         
+        // Analyze all recorded dispatches
         profilerData.dispatches.forEach(dispatch => {
           if (dispatch.workgroupSize && dispatch.dispatchSize) {
             workgroupAnalyzer.analyzeDispatch(dispatch);
@@ -1936,7 +2199,7 @@
         const summary = workgroupAnalyzer.getSummary();
         const analyses = workgroupAnalyzer.getAllAnalyses();
         
-        console.log('\n[WebSight] Workgroup Occupancy Report');
+        console.log('\n⚙️ [WebSight] Workgroup Occupancy Report');
         console.log('═'.repeat(60));
         
         if (summary) {
@@ -1946,7 +2209,7 @@
           console.log(`High Priority Issues: ${summary.highIssues}`);
           
           if (summary.needsAttention.length > 0) {
-            console.log(`\n${summary.needsAttention.length} Kernel(s) Need Attention:`);
+            console.log(`\n⚠️ ${summary.needsAttention.length} Kernel(s) Need Attention:`);
             summary.needsAttention.forEach(a => {
               console.log(`\n  Kernel: ${a.kernelId}`);
               console.log(`  Score: ${a.score}/100`);
@@ -1960,18 +2223,21 @@
               });
             });
           } else {
-            console.log('\nAll workgroup configurations look good!');
+            console.log('\n All workgroup configurations look good!');
           }
         } else {
-          console.log('\nNo dispatches to analyze yet. Run your WebGPU code first.');
+          console.log('\n No dispatches to analyze yet. Run your WebGPU code first.');
         }
         
         return { summary, analyses };
       },
       
+      // Shader Complexity Analysis
       getShaderAnalysis: () => {
-        console.log('\n[WebSight] Analyzing shader complexity...');
+        // Analyze all shaders on-demand
+        console.log('\n [WebSight] Analyzing shader complexity...');
         
+        // Analyze all kernels' shaders
         Object.values(profilerData.kernels).forEach(kernel => {
           if (kernel.shaderId && kernel.shader && !shaderAnalyzer.analyses.has(kernel.shaderId)) {
             shaderAnalyzer.analyzeShader(kernel.shaderId, kernel.shader);
@@ -1981,7 +2247,7 @@
         const summary = shaderAnalyzer.getSummary();
         const analyses = shaderAnalyzer.getAllAnalyses();
         
-        console.log('\n[WebSight] Shader Complexity Report');
+        console.log('\n [WebSight] Shader Complexity Report');
         console.log('═'.repeat(60));
         
         if (summary) {
@@ -1992,7 +2258,7 @@
           console.log(`Critical Issues: ${summary.criticalIssues}`);
           
           if (summary.needsOptimization.length > 0) {
-            console.log(`\n${summary.needsOptimization.length} Shader(s) Need Optimization:`);
+            console.log(`\n🔧 ${summary.needsOptimization.length} Shader(s) Need Optimization:`);
             summary.needsOptimization.forEach(a => {
               console.log(`\n  Shader ID: ${a.shaderId}`);
               console.log(`  Score: ${a.score}/100 (Grade: ${a.grade.letter})`);
@@ -2019,6 +2285,7 @@
         return { summary, analyses };
       },
       
+      // Get specific shader analysis by ID
       analyzeShader: (shaderId) => {
         const analysis = shaderAnalyzer.analyses.get(shaderId);
         if (!analysis) {
@@ -2026,7 +2293,7 @@
           return null;
         }
         
-        console.log(`\nShader Analysis: ${shaderId}`);
+        console.log(`\n Shader Analysis: ${shaderId}`);
         console.log('═'.repeat(60));
         console.log(`Score: ${analysis.score}/100 (${analysis.grade.letter})`);
         console.log(`Complexity: ${analysis.complexity.toFixed(1)}`);
@@ -2037,9 +2304,9 @@
           console.log('\nIssues:');
           analysis.issues.forEach(issue => {
             console.log(`  [${issue.severity.toUpperCase()}] ${issue.type}`);
-            console.log(`    ${issue.message}`);
-            console.log(`    Impact: ${issue.impact}`);
-            console.log(`    Fix: ${issue.recommendation}`);
+            console.log(`  ${issue.message}`);
+            console.log(`   Impact: ${issue.impact}`);
+            console.log(`   Fix: ${issue.recommendation}`);
             if (issue.example) {
               console.log(`    Example: ${issue.example}`);
             }
@@ -2049,15 +2316,16 @@
         return analysis;
       },
       
+      // Get comprehensive analysis report
       getFullAnalysisReport: () => {
-        console.log('\n[WebSight] COMPREHENSIVE ANALYSIS REPORT');
+        console.log('\n🚀 [WebSight] COMPREHENSIVE ANALYSIS REPORT');
         console.log('═'.repeat(80));
         
         const memoryReport = memoryLeakDetector.getLeakReport();
         const workgroupReport = workgroupAnalyzer.getSummary();
         const shaderReport = shaderAnalyzer.getSummary();
         
-        console.log('\nSUMMARY');
+        console.log('\n SUMMARY');
         console.log('-'.repeat(80));
         console.log(`Memory: ${memoryLeakDetector.formatBytes(memoryReport.stats.currentMemory)} / Peak: ${memoryLeakDetector.formatBytes(memoryReport.stats.peakMemory)}`);
         console.log(`Potential Leaks: ${memoryReport.summary.totalLeaks} (${memoryReport.summary.leakRate})`);
@@ -2072,7 +2340,7 @@
           console.log(`Critical Shader Issues: ${shaderReport.criticalIssues}`);
         }
         
-        console.log('\nCall specific methods for detailed reports:');
+        console.log('\n✨ Call specific methods for detailed reports:');
         console.log('  - WebSight.getMemoryLeaks()');
         console.log('  - WebSight.getWorkgroupAnalysis()');
         console.log('  - WebSight.getShaderAnalysis()');
@@ -2086,9 +2354,28 @@
       }
     };
     
+    // Initialize device limits when adapter is available
     window.addEventListener('load', () => {
       if (profilerData.gpuCharacteristics?.limits) {
         workgroupAnalyzer.setDeviceLimits(profilerData.gpuCharacteristics.limits);
+      }
+      
+      // Auto-launch profiler UI window (unless disabled or already UI window)
+      if (!window.__webSightDisableAutoUI && !window.__webSightIsUIWindow) {
+        // Determine the correct path to profiler-dashboard.html based on where profiler-standalone.js is loaded from
+        const scripts = document.querySelectorAll('script[src*="profiler-standalone.js"]');
+        let uiPath = 'profiler-dashboard.html';
+        if (scripts.length > 0) {
+          const scriptSrc = scripts[0].src;
+          const scriptDir = scriptSrc.substring(0, scriptSrc.lastIndexOf('/') + 1);
+          uiPath = scriptDir + 'profiler-dashboard.html';
+        }
+        
+        const profilerWindow = window.open(uiPath, 'WebSightProfiler', 'width=1400,height=900');
+        if (!profilerWindow) {
+          // Only warn if popup blocked
+          console.warn(`[WebSight] Could not open profiler UI (popup blocked?). Manually open: ${uiPath}`);
+        }
       }
     });
     
