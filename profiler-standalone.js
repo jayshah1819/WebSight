@@ -2362,13 +2362,12 @@
       
       // Auto-launch profiler UI window (unless disabled or already UI window)
       if (!window.__webSightDisableAutoUI && !window.__webSightIsUIWindow) {
-        // Determine the correct path to profiler-dashboard.html based on where profiler-standalone.js is loaded from
         const scripts = document.querySelectorAll('script[src*="profiler-standalone.js"]');
-        let uiPath = 'profiler-dashboard.html';
+        let uiPath = 'index.html';
         if (scripts.length > 0) {
           const scriptSrc = scripts[0].src;
           const scriptDir = scriptSrc.substring(0, scriptSrc.lastIndexOf('/') + 1);
-          uiPath = scriptDir + 'profiler-dashboard.html';
+          uiPath = scriptDir + 'index.html';
         }
         
         const profilerWindow = window.open(uiPath, 'WebSightProfiler', 'width=1400,height=900');
