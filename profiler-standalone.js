@@ -2187,7 +2187,7 @@
       // Workgroup Occupancy Analysis
       getWorkgroupAnalysis: () => {
         // Analyze all dispatches on-demand
-        console.log('\n⚙️ [WebSight] Analyzing workgroup configurations...');
+        console.log('\n [WebSight] Analyzing workgroup configurations...');
         
         // Analyze all recorded dispatches
         profilerData.dispatches.forEach(dispatch => {
@@ -2199,7 +2199,7 @@
         const summary = workgroupAnalyzer.getSummary();
         const analyses = workgroupAnalyzer.getAllAnalyses();
         
-        console.log('\n⚙️ [WebSight] Workgroup Occupancy Report');
+        console.log('\n [WebSight] Workgroup Occupancy Report');
         console.log('═'.repeat(60));
         
         if (summary) {
@@ -2209,7 +2209,7 @@
           console.log(`High Priority Issues: ${summary.highIssues}`);
           
           if (summary.needsAttention.length > 0) {
-            console.log(`\n⚠️ ${summary.needsAttention.length} Kernel(s) Need Attention:`);
+            console.log(`\n ${summary.needsAttention.length} Kernel(s) Need Attention:`);
             summary.needsAttention.forEach(a => {
               console.log(`\n  Kernel: ${a.kernelId}`);
               console.log(`  Score: ${a.score}/100`);
