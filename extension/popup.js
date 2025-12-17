@@ -33,7 +33,7 @@ function updateUI() {
             document.getElementById('stopBtn').disabled = false;
           } else {
             statusIndicator.className = 'status-indicator status-inactive';
-            statusIndicator.textContent = '⚫ Not Monitoring';
+            statusIndicator.textContent = ' Not Monitoring';
             statusMessage.textContent = 'Click "Start Profiling" to begin';
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;

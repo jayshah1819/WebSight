@@ -8,7 +8,7 @@
         window.__webSightDisableAutoUI = true;
         window.__webSightIsUIWindow = true;
     </script>
-    <script src="profiler-standalone.js"></script>
+    <script src="profiler-standalone.js?v=6"></script>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -128,7 +128,11 @@
         <div id="profiler-status">
             Status: <span id="status-text">Waiting for WebGPU app...</span><br>
             Timing Mode: <span id="timing-mode">Unknown</span><br>
-            Dispatches: <span id="dispatch-count">0</span>
+            Dispatches: <span id="dispatch-count">0</span><br>
+            <div style="margin-top: 10px;">
+                <button id="profiler-toggle-btn" onclick="toggleProfiling()" style="padding: 8px 15px; border: 2px solid #000; background: #00aa00; color: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 13px; font-weight: bold; margin-right: 10px;">■ Stop Profiling</button>
+                <button onclick="clearProfilingData()" style="padding: 8px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 13px;">Clear Data</button>
+            </div>
         </div>
 
         <!-- Summary Statistics Box -->
@@ -281,7 +285,7 @@
             <div class="box">
                 <h2>Workgroup Optimization</h2>
                 <div id="workgroup-analysis" style="font-size: 14px;">
-                    <button onclick="runWorkgroupAnalysis()" style="padding: 10px 15px; border: 2px solid #000; background: #fff; cursor: pointer; font-family: 'Courier New'; font-size: 14px; margin-bottom: 10px;">Run Analysis</button>
+                    <div style="color: #666; margin-bottom: 10px; font-size: 12px;">Live warnings appear below automatically</div>
                     <div id="workgroup-results"></div>
                 </div>
             </div>
@@ -352,11 +356,54 @@
             updateUI();
         });
 
-        // Update UI every second
-        setInterval(updateUI, 1000);
+        // Don't use setInterval - only update when broadcast messages arrive
+        // This prevents constant UI flickering during benchmarks
+        // setInterval(updateUI, 3000);
+        
+        // Profiler control functions
+        let profilingEnabled = true;
+        
+        function toggleProfiling() {
+            profilingEnabled = !profilingEnabled;
+            const btn = document.getElementById('profiler-toggle-btn');
+            
+            if (profilingEnabled) {
+                btn.textContent = '■ Stop Profiling';
+                btn.style.background = '#00aa00';
+                // Send message to enable profiling
+                profilerChannel.postMessage({ type: 'enable-profiling' });
+            } else {
+                btn.textContent = '▶ Start Profiling';
+                btn.style.background = '#cc0000';
+                // Send message to disable profiling
+                profilerChannel.postMessage({ type: 'disable-profiling' });
+            }
+        }
+        
+        function clearProfilingData() {
+            if (confirm('Clear all profiling data? This cannot be undone.')) {
+                // Send message to clear data
+                profilerChannel.postMessage({ type: 'clear-data' });
+                
+                // Also clear local UI data if WebSight is available
+                if (typeof WebSight !== 'undefined') {
+                    const data = WebSight.getData();
+                    data.dispatches = [];
+                    data.pipelines = {};
+                    data.buffers = {};
+                    data.kernels = {};
+                    data.logs = [];
+                }
+                
+                updateUI();
+            }
+        }
+
+        let lastReceivedData = null; // Store last received data for GPU characteristics
 
         profilerChannel.onmessage = (event) => {
             if (event.data.type === 'profiler-update') {
+                lastReceivedData = event.data.data; // Store for buffer limit checks
                 if (typeof WebSight !== 'undefined') {
                     const internalData = WebSight.getData();
                     // Merge incoming data
@@ -413,25 +460,8 @@
                 }
             }
             
-            // Check for atomic contention (if any kernel has atomic operations)
-            let hasAtomics = false;
-            let atomicContention = 'None';
-            for (const dispatch of allDispatches) {
-                if (dispatch.atomicOps && dispatch.atomicOps > 0) {
-                    hasAtomics = true;
-                    // Simple heuristic: high atomic ops relative to work items suggests contention
-                    const workItems = (dispatch.workgroupSize?.[0] || 1) * (dispatch.workgroupSize?.[1] || 1) * (dispatch.workgroupSize?.[2] || 1);
-                    if (dispatch.atomicOps > workItems * 0.5) {
-                        atomicContention = 'High';
-                        break;
-                    } else if (dispatch.atomicOps > workItems * 0.1) {
-                        atomicContention = 'Medium';
-                    } else if (atomicContention === 'None') {
-                        atomicContention = 'Low';
-                    }
-                }
-            }
-            if (!hasAtomics) atomicContention = 'N/A';
+            // Atomic contention is shown in the graph below
+            const atomicContention = 'See Graph';
             
             document.getElementById('total-gpu-time').textContent = (totalGpuTime / 1000).toFixed(2) + ' ms';
             document.getElementById('total-cpu-time').textContent = (totalCpuTime / 1000).toFixed(2) + ' ms';
@@ -440,79 +470,142 @@
             document.getElementById('atomic-contention').textContent = atomicContention;
             document.getElementById('total-dispatches').textContent = allDispatches.length;
             
-            // Set color based on contention level
-            const contentionEl = document.getElementById('atomic-contention');
-            if (atomicContention === 'High') contentionEl.style.color = '#cc0000';
-            else if (atomicContention === 'Medium') contentionEl.style.color = '#ff8800';
-            else if (atomicContention === 'Low') contentionEl.style.color = '#00aa00';
-            else contentionEl.style.color = '#666';
-            
             if (dispatches.length === 0) return;
             
-            const inputBytes = dispatches.map(d => {
+            // Group dispatches by largest data buffer size for bandwidth analysis
+            const sizeGroups = new Map();
+            
+            dispatches.forEach(d => {
                 const buffers = d.bufferAccesses || [];
-                const totalBytes = buffers.reduce((sum, b) => sum + (b.size || 0), 0);
-                return totalBytes > 0 ? totalBytes : 1024;
+                
+                // Filter to data buffers (large buffers or named data/in/out/key/payload)
+                const dataBuffers = buffers.filter(b => {
+                    const label = (b.label || '').toLowerCase();
+                    const size = b.size || 0;
+                    return size > 1024 * 1024 || 
+                           label.includes('in') || 
+                           label.includes('out') || 
+                           label.includes('key') ||
+                           label.includes('payload') ||
+                           label.includes('data') ||
+                           label.includes('buffer');
+                });
+                
+                // Use largest data buffer as proxy for working set size
+                const largestBuffer = dataBuffers.length > 0 
+                    ? Math.max(...dataBuffers.map(b => b.size || 0))
+                    : (buffers.length > 0 ? Math.max(...buffers.map(b => b.size || 0)) : 0);
+                
+                if (!sizeGroups.has(largestBuffer)) {
+                    sizeGroups.set(largestBuffer, []);
+                }
+                sizeGroups.get(largestBuffer).push(d);
             });
             
-            const gpuTimes = dispatches.map(d => (d.gpuTimeNs || d.gpuTime || 0) / 1000); // Convert ns to µs
-            const cpuTimes = dispatches.map(d => ((d.cpuEnd || 0) - (d.cpuStart || 0)) * 1000);
-            
-            const gpuBandwidth = dispatches.map((d, i) => {
-                const bytes = inputBytes[i];
-                const timeSeconds = gpuTimes[i] / 1e6;
-                return timeSeconds > 0 ? (bytes / timeSeconds) / 1e9 : 0;
+            // Create data points by summing dispatches with same buffer size
+            const dataPoints = [];
+            sizeGroups.forEach((dispatches, largestBuffer) => {
+                const inputBytes = largestBuffer;
+                const inputSizeMB = inputBytes / (1024 * 1024);
+                
+                // Calculate bytes transferred (read + write)
+                const bytesTransferred = largestBuffer * 2;
+                
+                // Separate GPU and CPU calculations
+                const gpuDispatches = dispatches.filter(d => d.timingSource === 'gpu_timestamp');
+                const useGpuTiming = gpuDispatches.length > 0;
+                
+                // Sum times for all dispatches with same buffer size
+                const totalGpuTimeNs = useGpuTiming
+                    ? gpuDispatches.reduce((sum, d) => sum + (d.gpuTimeNs || 0), 0)
+                    : dispatches.reduce((sum, d) => sum + (d.cpuTimeNs || 0), 0);
+                
+                const totalCpuTimeNs = dispatches.reduce((sum, d) => sum + (d.cpuTimeNs || 0), 0);
+                
+                // Calculate bandwidth: GB/s = bytesTransferred / time_ns
+                const gpuBandwidth = totalGpuTimeNs > 0 ? bytesTransferred / totalGpuTimeNs : 0;
+                const cpuBandwidth = totalCpuTimeNs > 0 ? bytesTransferred / totalCpuTimeNs : 0;
+                
+                // Create two data points (one for GPU, one for CPU)
+                dataPoints.push({
+                    inputSizeMB,
+                    inputBytes,
+                    time: totalGpuTimeNs,
+                    bandwidth: gpuBandwidth,
+                    timing: 'GPU'
+                });
+                
+                dataPoints.push({
+                    inputSizeMB,
+                    inputBytes,
+                    time: totalCpuTimeNs,
+                    bandwidth: cpuBandwidth,
+                    timing: 'CPU'
+                });
             });
             
-            const cpuBandwidth = dispatches.map((d, i) => {
-                const bytes = inputBytes[i];
-                const timeSeconds = cpuTimes[i] / 1e6;
-                return timeSeconds > 0 ? (bytes / timeSeconds) / 1e9 : 0;
-            });
+            // Sort by input size for proper line connections
+            dataPoints.sort((a, b) => a.inputBytes - b.inputBytes);
             
-            // Plot in chronological order (dispatch index) instead of sorting by size
-            // This keeps the timeline stable and shows how performance changes over time
-            const dispatchIndices = dispatches.map((_, i) => i);
+            // Separate GPU and CPU data for plotting
+            const gpuData = dataPoints.filter(d => d.timing === 'GPU');
+            const cpuData = dataPoints.filter(d => d.timing === 'CPU');
             
-            // Plot Bandwidth
-            plotGraph('bandwidth-graph', 
-                [
-                    {
-                        x: dispatchIndices,
-                        y: gpuBandwidth,
-                        name: 'GPU',
-                        line: { color: '#00aa00', width: 2 }
-                    },
-                    {
-                        x: dispatchIndices,
-                        y: cpuBandwidth,
-                        name: 'CPU',
-                        line: { color: '#000000', width: 2 }
-                    }
-                ],
-                'Dispatch Index',
-                'Achieved bandwidth (GB/s)'
-            );
+            const inputSizes = [...new Set(dataPoints.map(d => d.inputSizeMB))].sort((a, b) => a - b);
+            const gpuBandwidth = gpuData.map(d => d.bandwidth);
+            const cpuBandwidth = cpuData.map(d => d.bandwidth);
+            const gpuTimes = gpuData.map(d => d.time / 1000);
+            const cpuTimes = cpuData.map(d => d.time / 1000);
             
-            // Plot Time
-            plotGraph('time-graph',
-                [
-                    {
-                        x: dispatchIndices,
-                        y: gpuTimes,
-                        name: 'GPU',
-                        line: { color: '#00aa00', width: 2 }
-                    },
-                    {
-                        x: dispatchIndices,
-                        y: cpuTimes,
-                        name: 'CPU',
-                        line: { color: '#000000', width: 2 }
-                    }
-                ],
-                'Dispatch Index',
-                'Time (μs)'
-            );
+            // Check if GPU timing is available
+            const hasGpuTiming = gpuData.some(d => d.time > 0 && d.time !== cpuData.find(c => c.inputBytes === d.inputBytes)?.time);
+            
+            // Plot Bandwidth vs Input Size
+            const bandwidthTraces = [
+                {
+                    x: inputSizes,
+                    y: gpuBandwidth,
+                    name: 'GPU',
+                    line: { color: '#00aa00', width: 2 },
+                    mode: 'lines+markers'
+                }
+            ];
+            
+            // Show CPU bandwidth only if GPU timing unavailable
+            if (!hasGpuTiming) {
+                bandwidthTraces.push({
+                    x: inputSizes,
+                    y: cpuBandwidth,
+                    name: 'CPU (JS overhead)',
+                    line: { color: '#666666', width: 1, dash: 'dot' },
+                    mode: 'lines+markers'
+                });
+            }
+            
+            plotGraph('bandwidth-graph', bandwidthTraces, 'Input Size (MB)', 'Bandwidth (GB/s)');
+            
+            // Plot Time vs Input Size
+            const timeTraces = [
+                {
+                    x: inputSizes,
+                    y: gpuTimes,
+                    name: 'GPU',
+                    line: { color: '#00aa00', width: 2 },
+                    mode: 'lines+markers'
+                }
+            ];
+            
+            if (!hasGpuTiming) {
+                timeTraces.push({
+                    x: inputSizes,
+                    y: cpuTimes,
+                    name: 'CPU (JS overhead)',
+                    line: { color: '#666666', width: 1, dash: 'dot' },
+                    mode: 'lines+markers'
+                });
+            }
+            
+            plotGraph('time-graph', timeTraces, 'Input Size (MB)', 'Time (μs)');
             
             // Buffer Size Graph
             plotBufferSizes(data.buffers);
@@ -525,6 +618,144 @@
             updateKernelList(data.kernels);
             
             updateKernelGraphs(data);
+            
+            // Update workgroup summary automatically
+            updateWorkgroupSummary(data.dispatches);
+        }
+        
+        function updateWorkgroupSummary(dispatches) {
+            if (!dispatches || dispatches.length === 0) {
+                return;
+            }
+            
+            const resultsDiv = document.getElementById('workgroup-results');
+            
+            // Group by pipeline and workgroup config
+            const configGroups = new Map();
+            
+            dispatches.forEach(d => {
+                // IMPORTANT: Show ALL dispatches, not just those with occupancy analysis
+                // Skip only if we have neither analysis nor dimension violation
+                if (!d.occupancyAnalysis && !d.dimensionViolation) {
+                    return;
+                }
+                
+                const key = `${d.pipelineLabel}|${d.workgroupSize.join('x')}`;
+                if (!configGroups.has(key)) {
+                    configGroups.set(key, {
+                        pipeline: d.pipelineLabel || 'compute_pipeline',
+                        workgroupSize: d.workgroupSize,
+                        dispatchSize: d.dispatchSize,
+                        analysis: d.occupancyAnalysis || { score: 0, issues: [] },
+                        count: 0,
+                        dimensionViolation: false
+                    });
+                }
+                const group = configGroups.get(key);
+                group.count++;
+                if (d.dimensionViolation) {
+                    group.dimensionViolation = true;
+                }
+            });
+            
+            if (configGroups.size === 0) {
+                resultsDiv.innerHTML = '<div style="margin-top: 10px; color: #666;">No workgroup analysis data yet. Run benchmarks first.</div>';
+                return;
+            }
+            
+            // Create summary table
+            let html = '<div style="margin-top: 10px; font-family: \'Courier New\', monospace; font-size: 12px;">';
+            html += '<table style="width: 100%; border-collapse: collapse; border: 2px solid #000;">';
+            html += '<tr style="background: #000; color: #fff; font-weight: bold;">';
+            html += '<th style="padding: 8px; border: 1px solid #000; text-align: left;">Pipeline</th>';
+            html += '<th style="padding: 8px; border: 1px solid #000; text-align: center;">Workgroup Size</th>';
+            html += '<th style="padding: 8px; border: 1px solid #000; text-align: center;">Dispatch Size</th>';
+            html += '<th style="padding: 8px; border: 1px solid #000; text-align: center;">Utilization</th>';
+            html += '<th style="padding: 8px; border: 1px solid #000; text-align: center;">Score</th>';
+            html += '<th style="padding: 8px; border: 1px solid #000; text-align: center;">Status</th>';
+            html += '<th style="padding: 8px; border: 1px solid #000; text-align: left;">Issues</th>';
+            html += '</tr>';
+            
+            const sortedGroups = Array.from(configGroups.values()).sort((a, b) => a.analysis.score - b.analysis.score);
+            
+            sortedGroups.forEach(group => {
+                const score = group.analysis.score;
+                const scoreColor = score >= 80 ? '#00aa00' : score >= 60 ? '#ff8800' : '#cc0000';
+                const statusText = group.dimensionViolation ? 'FAILED' : score >= 80 ? 'Good' : score >= 60 ? 'Suboptimal' : 'Poor';
+                const statusColor = group.dimensionViolation ? '#cc0000' : scoreColor;
+                
+                html += '<tr style="border: 1px solid #ccc;">';
+                html += `<td style="padding: 8px; border: 1px solid #ccc; font-size: 10px;">${group.pipeline}</td>`;
+                html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-weight: bold;">${group.workgroupSize.join(' × ')}</td>`;
+                html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center;">${group.dispatchSize.join(' × ')}</td>`;
+                
+                // Show workgroup utilization
+                if (group.analysis.workgroupUtilization) {
+                    const util = group.analysis.workgroupUtilization;
+                    
+                    // Use explicit flags if available, otherwise calculate
+                    const xExceeds = util.xExceeds !== undefined ? util.xExceeds : (util.xDim > util.maxPerDim);
+                    const yExceeds = util.yExceeds !== undefined ? util.yExceeds : (util.yDim > util.maxPerDim);
+                    const zExceeds = util.zExceeds !== undefined ? util.zExceeds : (util.zDim > util.maxPerDim);
+                    const anyExceeds = xExceeds || yExceeds || zExceeds;
+                    
+                    const utilizationColor = anyExceeds ? '#cc0000' : '#666';
+                    html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-size: 10px; color: ${utilizationColor};">`;
+                    html += `<strong>${util.total.toLocaleString()} WGs</strong><br>`;
+                    html += `<span style="color: ${xExceeds ? '#cc0000' : '#666'}; ${xExceeds ? 'font-weight: bold;' : ''}">X: ${util.xPercent}%${xExceeds ? ' EXCEEDS!' : ''}</span>`;
+                    if (util.yDim > 1) html += `<br><span style="color: ${yExceeds ? '#cc0000' : '#666'}; ${yExceeds ? 'font-weight: bold;' : ''}">Y: ${util.yPercent}%${yExceeds ? ' EXCEEDS!' : ''}</span>`;
+                    if (util.zDim > 1) html += `<br><span style="color: ${zExceeds ? '#cc0000' : '#666'}; ${zExceeds ? 'font-weight: bold;' : ''}">Z: ${util.zPercent}%${zExceeds ? ' EXCEEDS!' : ''}</span>`;
+                    html += '</td>';
+                } else {
+                    html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; color: #999;">—</td>`;
+                }
+                
+                html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-weight: bold; color: ${scoreColor};">${score}/100</td>`;
+                html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-weight: bold; color: ${statusColor};">${statusText}</td>`;
+                html += `<td style="padding: 8px; border: 1px solid #ccc; font-size: 10px;">`;
+                
+                // Show dimension violations first and most prominently
+                const criticalIssues = group.analysis.issues.filter(i => i.severity === 'critical');
+                const otherIssues = group.analysis.issues.filter(i => i.severity !== 'critical');
+                
+                if (criticalIssues.length > 0) {
+                    criticalIssues.forEach(issue => {
+                        html += `<strong style="color: #cc0000;">• ${issue.message}</strong><br>`;
+                    });
+                }
+                
+                if (group.dimensionViolation && criticalIssues.length === 0) {
+                    html += '<strong style="color: #cc0000;">• DISPATCH EXCEEDS GPU LIMIT</strong><br>';
+                }
+                
+                // Show other issues (non-critical)
+                const displayIssues = otherIssues.slice(0, 2);
+                displayIssues.forEach(issue => {
+                    html += `• ${issue.message}<br>`;
+                });
+                
+                html += '</td>';
+                html += '</tr>';
+            });
+            
+            html += '</table>';
+            
+            // Summary stats
+            const totalConfigs = configGroups.size;
+            const goodConfigs = sortedGroups.filter(g => g.analysis.score >= 80 && !g.dimensionViolation).length;
+            const failedConfigs = sortedGroups.filter(g => g.dimensionViolation).length;
+            
+            html += '<div style="margin-top: 12px; padding: 10px; border: 2px solid #000; background: #f5f5f5;">';
+            html += `<strong>Summary:</strong> ${totalConfigs} configuration${totalConfigs > 1 ? 's' : ''} analyzed | `;
+            html += `<span style="color: #00aa00;">${goodConfigs} optimized</span> | `;
+            if (failedConfigs > 0) {
+                html += `<span style="color: #cc0000;">${failedConfigs} FAILED</span>`;
+            } else {
+                html += `<span style="color: #666;">0 failed</span>`;
+            }
+            html += '</div>';
+            
+            resultsDiv.innerHTML = html;
         }
 
         // Helper function to format large numbers (1B, 1M, 1K, etc.)
@@ -608,12 +839,24 @@
                 return;
             }
             
+            // Get max buffer size from GPU characteristics (typically 2GB or 4GB)
+            const maxBufferSize = lastReceivedData?.gpuCharacteristics?.limits?.maxBufferSize || (2 * 1024 * 1024 * 1024); // Default 2GB
+            const maxBufferSizeMB = maxBufferSize / (1024 * 1024);
+            const warningThreshold = maxBufferSize * 0.9; // Warn at 90% of max
+            
             const input = [], output = [], atomic = [], uniform = [], labels = [];
+            const warnings = []; // Track buffers near limit
             
             bufferArray.forEach((b, i) => {
                 const label = b.label || `Buffer ${i}`;
                 labels.push(label);
                 const sizeKB = b.size / 1024; // Use KB for display
+                
+                // Check if buffer is near max size
+                if (b.size >= warningThreshold) {
+                    const percentOfMax = ((b.size / maxBufferSize) * 100).toFixed(1);
+                    warnings.push({ label, size: b.size, percentOfMax });
+                }
                 
                 // Categorize by label name (most reliable indicator)
                 const labelLower = (b.label || '').toLowerCase();
@@ -666,21 +909,57 @@
                 margin: { l: 60, r: 20, t: 20, b: 100 },
                 font: { family: 'Courier New', size: 10 }
             }, { displayModeBar: false, responsive: true });
+            
+            // Add warnings for buffers near max size
+            if (warnings.length > 0) {
+                let warningHtml = '<div style="margin-top: 10px; padding: 10px; background: #fff3cd; border: 2px solid #ff8800; border-radius: 4px; font-size: 11px;">';
+                warningHtml += '<strong style="color: #ff8800;">Buffer Size Warnings:</strong><br>';
+                warnings.forEach(w => {
+                    const sizeMB = (w.size / (1024 * 1024)).toFixed(2);
+                    warningHtml += `• <strong>${w.label}</strong>: ${sizeMB} MB (${w.percentOfMax}% of max ${maxBufferSizeMB.toFixed(0)} MB)<br>`;
+                });
+                warningHtml += '<span style="color: #666; font-size: 10px;">Buffers exceeding 90% of GPU max buffer size may cause allocation failures.</span>';
+                warningHtml += '</div>';
+                document.getElementById('buffer-size-graph').insertAdjacentHTML('afterend', warningHtml);
+            }
         }
 
         function plotAtomicContention(dispatches) {
             const x = [], y = [];
             
             dispatches.forEach((d, i) => {
-                const atomicBuffers = (d.bufferAccesses || []).filter(b => 
-                    b.label && b.label.toLowerCase().includes('atomic')
-                );
+                const buffers = d.bufferAccesses || [];
+                
+                // Look for potential atomic buffers (small buffers with relevant names)
+                const atomicBuffers = buffers.filter(b => {
+                    const label = (b.label || '').toLowerCase();
+                    const size = b.size || 0;
+                    const sizeMB = size / (1024 * 1024);
+                    
+                    return (label.includes('atomic') || 
+                           label.includes('hist') || 
+                           label.includes('histogram') ||
+                           label.includes('counter')) &&
+                           sizeMB < 10;
+                });
                 
                 if (atomicBuffers.length > 0) {
-                    const totalThreads = d.x * d.y * d.z;
-                    const bins = atomicBuffers[0].size / 4;
-                    x.push(i);
-                    y.push(totalThreads / bins);
+                    // Calculate total threads
+                    const dispatchSize = d.dispatchSize || [d.x || 1, d.y || 1, d.z || 1];
+                    const workgroupSize = d.workgroupSize || [1, 1, 1];
+                    const totalThreads = 
+                        dispatchSize[0] * dispatchSize[1] * dispatchSize[2] *
+                        workgroupSize[0] * workgroupSize[1] * workgroupSize[2];
+                    
+                    // Calculate bins from buffer size
+                    const bufferSize = atomicBuffers[0].size || 0;
+                    const bins = bufferSize / 4;
+                    const threadsPerBin = bins > 0 ? totalThreads / bins : 0;
+                    
+                    if (threadsPerBin > 0) {
+                        x.push(i);
+                        y.push(threadsPerBin);
+                    }
                 }
             });
             
@@ -707,11 +986,14 @@
             
             div.innerHTML = recent.map(d => {
                 // Use gpuTimeUs (microseconds) which is what the profiler stores
-                const gpuTimeDisplay = d.gpuTimeUs 
-                    ? `${d.gpuTimeUs.toFixed(2)} μs (${d.gpuTimeMs.toFixed(3)} ms)`
+                const gpuTimeDisplay = d.gpuTimeUs && d.timingSource === 'gpu_timestamp'
+                    ? `${d.gpuTimeUs.toFixed(2)} μs`
+                    : d.cpuTimeUs 
+                    ? `${d.cpuTimeUs.toFixed(2)} μs (CPU fallback)`
                     : 'pending';
-                const cpuTime = d.cpuEnd && d.cpuStart 
-                    ? ((d.cpuEnd - d.cpuStart) * 1000).toFixed(2) 
+                
+                const cpuTime = d.cpuTimeUs 
+                    ? d.cpuTimeUs.toFixed(2)
                     : '0.00';
                 
                 // Create a better label
@@ -719,31 +1001,33 @@
                     ? d.pipelineLabel 
                     : 'Unlabeled Pipeline';
                 
-                const dispatchTitle = d.type === 'draw' 
+                // Use passType instead of type
+                const dispatchType = d.passType || 'unknown';
+                const dispatchTitle = dispatchType === 'draw' 
                     ? `Draw Call #${d.index}`
-                    : d.type === 'compute'
-                    ? `Compute Dispatch #${d.index}`
-                    : `${d.type} #${d.index}`;
+                    : dispatchType === 'compute'
+                    ? `Compute #${d.index}`
+                    : `Dispatch #${d.index}`;
                 
                 // Handle different dispatch types
-                const workgroupInfo = d.type === 'compute' 
-                    ? `Workgroups: ${d.x || '?'}×${d.y || '?'}×${d.z || '?'}`
-                    : d.type === 'draw'
+                const workgroupInfo = dispatchType === 'compute' 
+                    ? `Dispatch: ${d.dispatchSize ? d.dispatchSize.join('×') : `${d.x}×${d.y}×${d.z}`} | Workgroup: ${d.workgroupSize ? d.workgroupSize.join('×') : '?'}`
+                    : dispatchType === 'draw'
                     ? `Vertices: ${d.vertexCount}, Instances: ${d.instanceCount}`
-                    : `Type: ${d.type}`;
+                    : `Type: ${dispatchType}`;
+                
+                // Hide if CPU time is too small (just overhead)
+                if (d.cpuTimeNs < 100) return ''; // Less than 100ns is just noise
                 
                 return `
                     <div class="dispatch-item">
                         <strong>${dispatchTitle}</strong><br>
                         Pipeline: ${pipelineLabel}<br>
                         ${workgroupInfo}<br>
-                        GPU Time: ${gpuTimeDisplay}<br>
-                        CPU Time: ${cpuTime} μs<br>
-                        Source: ${d.timingSource || 'unknown'}<br>
-                        Pass: ${d.passType || 'unknown'}
+                        Time: ${gpuTimeDisplay}
                     </div>
                 `;
-            }).join('');
+            }).filter(x => x).join(''); // Filter out empty strings
         }
 
         function updateKernelList(kernels) {
@@ -755,24 +1039,41 @@
                 return;
             }
             
-            div.innerHTML = kernelArray.map((k, idx) => {
+            // Filter out kernels with no meaningful stats
+            const meaningfulKernels = kernelArray.filter(k => 
+                k.stats && k.stats.count > 0 && k.stats.totalTime > 0
+            );
+            
+            if (meaningfulKernels.length === 0) {
+                div.innerHTML = '<div style="padding: 20px; color: #666;">Collecting kernel statistics...</div>';
+                return;
+            }
+            
+            div.innerHTML = meaningfulKernels.map((k, idx) => {
                 // All kernel stats are in nanoseconds - convert to microseconds and milliseconds
-                const avgTime = k.stats?.avgTime ? (k.stats.avgTime / 1000).toFixed(2) : 'N/A';
-                const totalTime = k.stats?.totalTime ? (k.stats.totalTime / 1000000).toFixed(3) : 'N/A';
-                const minTime = k.stats?.minTime !== Infinity && k.stats?.minTime ? (k.stats.minTime / 1000).toFixed(2) : 'N/A';
-                const maxTime = k.stats?.maxTime ? (k.stats.maxTime / 1000).toFixed(2) : 'N/A';
-                const wg = k.workgroupSize || { x: 0, y: 0, z: 0 };
+                const avgTime = k.stats.avgTime ? (k.stats.avgTime / 1000).toFixed(2) : 'N/A';
+                const totalTime = k.stats.totalTime ? (k.stats.totalTime / 1000000).toFixed(3) : 'N/A';
+                const minTime = k.stats.minTime && k.stats.minTime !== Infinity 
+                    ? (k.stats.minTime / 1000).toFixed(2) 
+                    : 'N/A';
+                const maxTime = k.stats.maxTime ? (k.stats.maxTime / 1000).toFixed(2) : 'N/A';
                 
-                // Use label if available, otherwise use a descriptive name
-                const kernelName = k.label && k.label.trim() 
+                // Get workgroup size
+                const wg = k.workgroupSize || [1, 1, 1];
+                const wgStr = Array.isArray(wg) 
+                    ? wg.join('×') 
+                    : `${wg.x || 1}×${wg.y || 1}×${wg.z || 1}`;
+                
+                // Use label if available
+                const kernelName = k.label && k.label.trim() && k.label !== 'compute_pipeline'
                     ? k.label 
-                    : `Kernel ${idx + 1} (${k.id ? k.id.substring(0, 12) : 'unknown'}...)`;
+                    : `Pipeline #${idx + 1}`;
                 
                 return `
                     <div class="dispatch-item">
                         <strong>${kernelName}</strong><br>
-                        Workgroup: ${wg.x}×${wg.y}×${wg.z}<br>
-                        Dispatches: ${k.stats?.count || 0}<br>
+                        Workgroup: ${wgStr}<br>
+                        Calls: ${k.stats.count}<br>
                         Avg: ${avgTime} μs<br>
                         Total: ${totalTime} ms<br>
                         Range: ${minTime} - ${maxTime} μs

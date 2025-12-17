@@ -224,8 +224,8 @@
     },
     activeEncoders: new WeakMap(),
     config: {
-      broadcastEnabled: true,
-      broadcastDebounceMs: 5000,
+      broadcastEnabled: true,  // Enable broadcasting to UI
+      broadcastDebounceMs: 3000,  // Update every 3 seconds to reduce flickering
       normalizeTimeUnit: 'us',
       
       verboseLogging: false,
@@ -233,7 +233,7 @@
       minimalOverhead: false,
       
       enableMemoryLeakDetection: false,
-      enableWorkgroupAnalysis: false,
+      enableWorkgroupAnalysis: true,  // Enable by default to catch dispatch geometry issues
       enableShaderAnalysis: false,
       captureStacks: false,
       
@@ -457,10 +457,18 @@
     }
     
     analyzeDispatch(dispatch) {
-      if (!this.deviceLimits) return null;
+      if (!this.deviceLimits) {
+        console.warn('[WebSight] Cannot analyze dispatch - device limits not set yet');
+        return null;
+      }
       
       const wgSize = dispatch.workgroupSize;
       const dispatchSize = dispatch.dispatchSize;
+      
+      if (!wgSize || !dispatchSize) {
+        console.warn('[WebSight] Cannot analyze dispatch - missing workgroup or dispatch size');
+        return null;
+      }
       
       const analysis = {
         kernelId: dispatch.kernelId,
@@ -476,8 +484,87 @@
       
       analysis.totalInvocations = analysis.totalThreads * analysis.totalWorkgroups;
       
-      // Issue 1: Workgroup size not multiple of SIMD width
-      if (analysis.totalThreads % this.optimal.simdWidth !== 0) {
+      // Check if dispatch dimensions exceed device limits
+      const maxDim = this.deviceLimits.maxComputeWorkgroupsPerDimension || 65535;
+      const totalWorkgroupCount = dispatchSize[0] * dispatchSize[1] * dispatchSize[2];
+      
+      let hasCriticalDimensionError = false;
+      
+      if (dispatchSize[0] > maxDim) {
+        hasCriticalDimensionError = true;
+        analysis.issues.push({
+          severity: 'critical',
+          type: 'exceeds-x-limit',
+          message: `X dimension (${dispatchSize[0]}) exceeds limit (${maxDim})`,
+          impact: 'GPU will REJECT this dispatch',
+          recommendation: `Split X into Y/Z dimensions. Check getDispatchGeometry() logic.`
+        });
+        analysis.score = 0;
+      }
+      
+      if (dispatchSize[1] > maxDim) {
+        hasCriticalDimensionError = true;
+        analysis.issues.push({
+          severity: 'critical',
+          type: 'exceeds-y-limit',
+          message: `Y dimension (${dispatchSize[1]}) exceeds limit (${maxDim})`,
+          impact: 'GPU will REJECT this dispatch',
+          recommendation: `BUG DETECTED: Y overflow suggests nested if-inside-while in getSimpleDispatchGeometry(). Use separate sequential while loops: first reduce X→Y, then reduce Y→Z.`
+        });
+        analysis.score = 0;
+      }
+      
+      if (dispatchSize[2] > maxDim) {
+        hasCriticalDimensionError = true;
+        analysis.issues.push({
+          severity: 'critical',
+          type: 'exceeds-z-limit',
+          message: `Z dimension (${dispatchSize[2]}) exceeds limit (${maxDim})`,
+          impact: 'GPU will REJECT this dispatch',
+          recommendation: `Total workgroups (${totalWorkgroupCount}) too large. Reduce workgroup count or use tiling.`
+        });
+        analysis.score = 0;
+      }
+      
+      // Small utility dispatches get lenient scoring
+      const isSmallUtilityDispatch = !hasCriticalDimensionError 
+        && totalWorkgroupCount < 256 
+        && analysis.totalThreads >= 8
+        && analysis.totalThreads < 64;
+      
+      // Calculate workgroup utilization
+      const maxWorkgroupsPerDim = this.deviceLimits.maxComputeWorkgroupsPerDimension;
+      const xUtilization = ((dispatchSize[0] / maxWorkgroupsPerDim) * 100).toFixed(1);
+      const yUtilization = ((dispatchSize[1] / maxWorkgroupsPerDim) * 100).toFixed(1);
+      const zUtilization = ((dispatchSize[2] / maxWorkgroupsPerDim) * 100).toFixed(1);
+      
+      analysis.workgroupUtilization = {
+        total: totalWorkgroupCount,
+        xPercent: parseFloat(xUtilization),
+        yPercent: parseFloat(yUtilization),
+        zPercent: parseFloat(zUtilization),
+        xDim: dispatchSize[0],
+        yDim: dispatchSize[1],
+        zDim: dispatchSize[2],
+        maxPerDim: maxWorkgroupsPerDim,
+        xExceeds: dispatchSize[0] > maxWorkgroupsPerDim,
+        yExceeds: dispatchSize[1] > maxWorkgroupsPerDim,
+        zExceeds: dispatchSize[2] > maxWorkgroupsPerDim
+      };
+      
+      if (isSmallUtilityDispatch) {
+        analysis.score = 70;
+        analysis.issues.push({
+          severity: 'info',
+          type: 'utility-dispatch',
+          message: `Small utility dispatch (${totalWorkgroupCount} workgroups)`,
+          impact: 'Acceptable for finalization/reduction passes',
+          recommendation: 'No action needed for small auxiliary kernels'
+        });
+      }
+      
+      // Issue 1: Workgroup size not multiple of SIMD width (skip for small utility dispatches)
+      if (!isSmallUtilityDispatch && analysis.totalThreads % this.optimal.simdWidth !== 0) {
         const wastedThreads = this.optimal.simdWidth - (analysis.totalThreads % this.optimal.simdWidth);
         const efficiency = ((analysis.totalThreads / (analysis.totalThreads + wastedThreads)) * 100).toFixed(1);
         
@@ -491,7 +578,7 @@
         analysis.score -= 20;
       }
       
-      if (analysis.totalThreads < 64) {
+      if (!isSmallUtilityDispatch && analysis.totalThreads < 64) {
         analysis.issues.push({
           severity: 'high',
           type: 'low-occupancy',
@@ -966,6 +1053,31 @@
 
   const profilerChannel = new BroadcastChannel('websight-profiler');
   let broadcastTimer = null;
+  
+  // Listen for control messages from UI
+  profilerChannel.onmessage = (event) => {
+    if (window.__webSightIsUIWindow) return; // Only profiler window handles these
+    
+    const msg = event.data;
+    
+    if (msg.type === 'enable-profiling') {
+      profilerData.config.broadcastEnabled = true;
+      console.log('[WebSight] Profiling ENABLED');
+    } else if (msg.type === 'disable-profiling') {
+      profilerData.config.broadcastEnabled = false;
+      console.log('[WebSight] Profiling DISABLED');
+    } else if (msg.type === 'clear-data') {
+      // Clear all profiling data
+      profilerData.dispatches = [];
+      profilerData.pipelines = {};
+      profilerData.buffers = {};
+      profilerData.kernels = {};
+      profilerData.logs = [];
+      profilerData.runs = {};
+      console.log('[WebSight] Profiling data CLEARED');
+      broadcastData(); // Send empty data to UI
+    }
+  };
 
   function broadcastData() {
     if (window.__webSightIsUIWindow) {
@@ -979,12 +1091,32 @@
     
     broadcastTimer = setTimeout(() => {
       try {
+        // Filter buffers to only include those that are actually used in dispatches
+        const usedBufferIds = new Set();
+        profilerData.dispatches.forEach(dispatch => {
+          if (dispatch.bufferAccesses) {
+            dispatch.bufferAccesses.forEach(bufferAccess => {
+              if (bufferAccess && bufferAccess.id) {
+                usedBufferIds.add(bufferAccess.id);
+              }
+            });
+          }
+        });
+        
+        // Only send buffers that have been accessed
+        const filteredBuffers = {};
+        usedBufferIds.forEach(id => {
+          if (profilerData.buffers[id]) {
+            filteredBuffers[id] = profilerData.buffers[id];
+          }
+        });
+        
         const payload = {
           type: 'profiler-update',
           data: {
             dispatches: profilerData.dispatches,
             pipelines: profilerData.pipelines,
-            buffers: profilerData.buffers,
+            buffers: filteredBuffers, // Only send used buffers
             kernels: profilerData.kernels,
             logs: profilerData.logs,
             gpuCharacteristics: profilerData.gpuCharacteristics,
@@ -1152,8 +1284,6 @@
           profilerData.timingMode = shouldUseGPUTiming ? 'gpu' : 'cpu-only';
           
           const deviceInfo = {
-            device,
-            adapter,
             hasTimestampQuery,
             createdAt: Date.now(),
             label: descriptor?.label || `device_${window.__webSightDevices.length + 1}`,
@@ -1166,6 +1296,12 @@
           };
           window.__webSightDevices.push(deviceInfo);
           adapterInfo.devices.push(deviceInfo);
+          
+          // Initialize workgroup analyzer with device limits immediately
+          if (!workgroupAnalyzer.deviceLimits && device.limits) {
+            workgroupAnalyzer.setDeviceLimits(device.limits);
+            console.log('[WebSight] Workgroup analysis initialized - monitoring dispatch geometry');
+          }
           
           // Add uncaptured error handler to catch QuerySet allocation failures
           device.addEventListener('uncapturederror', (event) => {
@@ -1526,28 +1662,71 @@
 
               const origDispatch = pass.dispatchWorkgroups.bind(pass);
               pass.dispatchWorkgroups = function(x, y, z) {
-                const pipeline = this.__boundPipeline?.__capture;
+                const pipelineObj = this.__boundPipeline;
+                const pipeline = pipelineObj?.__capture;
                 
                 if (!pipeline) {
                   console.warn('[WebSight] Dispatch without pipeline!');
                   origDispatch(x, y, z);
                   return;
                 }
+                
+                // Get label from pipeline object or capture
+                const pipelineLabel = pipelineObj?.label || pipeline?.label || 'compute_pipeline';
 
                 const kernelId = generateKernelId(
                   pipeline.shader, 
                   pipeline.workgroupSize, 
-                  pipeline.label
+                  pipelineLabel
                 );
 
                 if (!profilerData.kernels[kernelId]) {
                   profilerData.kernels[kernelId] = {
                     id: kernelId,
-                    label: pipeline.label,
+                    label: pipelineLabel,
                     workgroupSize: pipeline.workgroupSize,
                     shader: pipeline.shader,
                     stats: { count: 0, totalTime: 0, avgTime: 0, minTime: Infinity, maxTime: 0 }
                   };
+                }
+
+                // CRITICAL: Check dispatch dimensions BEFORE executing
+                const maxDim = device.limits?.maxComputeWorkgroupsPerDimension || 65535;
+                const dispatchX = x || 1;
+                const dispatchY = y || 1;
+                const dispatchZ = z || 1;
+                
+                let dimensionViolation = false;
+                let violationMsg = '';
+                
+                // Check 1: Any dimension exceeds max limit
+                if (dispatchX > maxDim) {
+                  dimensionViolation = true;
+                  violationMsg += `X dimension (${dispatchX}) exceeds limit ${maxDim}. `;
+                }
+                if (dispatchY > maxDim) {
+                  dimensionViolation = true;
+                  violationMsg += `Y dimension (${dispatchY}) exceeds limit ${maxDim}. `;
+                }
+                if (dispatchZ > maxDim) {
+                  dimensionViolation = true;
+                  violationMsg += `Z dimension (${dispatchZ}) exceeds limit ${maxDim}. `;
+                }
+                
+                // Report dimension violations without trying to auto-correct
+                if (dimensionViolation) {
+                  const errorMsg = `DISPATCH GEOMETRY ERROR: ${violationMsg}`;
+                  
+                  profilerData.logs.push({
+                    timestamp: Date.now(),
+                    level: 'error',
+                    category: 'dispatch-geometry',
+                    message: errorMsg,
+                    details: `Pipeline: "${pipelineLabel}"\nDispatch: [${dispatchX}, ${dispatchY}, ${dispatchZ}]\nWorkgroup: [${pipeline.workgroupSize?.join(', ') || '?'}]\nMax Allowed Per Dimension: ${maxDim}\n\nWARNING: This dispatch will be REJECTED by the GPU driver!\nRoot Cause: Likely nested if-inside-while in getSimpleDispatchGeometry(). Y dimension must be reduced in a separate while loop AFTER X is fully reduced.`
+                  });
+                  
+                  // Trigger immediate broadcast for critical errors
+                  broadcastData();
                 }
 
                 const cpuStart = performance.now();
@@ -1556,11 +1735,25 @@
                 const cpuTimeMs = cpuEnd - cpuStart;
                 const cpuTimeNs = cpuTimeMs * 1000000;
 
+                // Convert workgroupSize to array format (handles both object and array)
+                let workgroupSizeArray = [1, 1, 1];
+                if (pipeline.workgroupSize) {
+                  if (Array.isArray(pipeline.workgroupSize)) {
+                    workgroupSizeArray = pipeline.workgroupSize;
+                  } else if (typeof pipeline.workgroupSize === 'object') {
+                    workgroupSizeArray = [
+                      pipeline.workgroupSize.x || 1,
+                      pipeline.workgroupSize.y || 1,
+                      pipeline.workgroupSize.z || 1
+                    ];
+                  }
+                }
+
                 const dispatchRecord = {
                   index: profilerData.dispatches.length,
                   kernelId: kernelId,
-                  pipelineLabel: pipeline.label,
-                  workgroupSize: pipeline.workgroupSize,
+                  pipelineLabel: pipelineLabel,
+                  workgroupSize: workgroupSizeArray,
                   dispatchSize: [x || 1, y || 1, z || 1],
                   x, y, z,
                   cpuStart,
@@ -1578,6 +1771,7 @@
                   timestampEnd: -1,
                   deviceLabel: device.__webSightInfo.label, // Multi-GPU tracking
                   passType: 'compute',
+                  dimensionViolation: dimensionViolation, // Mark failed dispatches
                   bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
                     bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
                       ...profilerData.buffers[e.resource.id],
@@ -1588,10 +1782,45 @@
                 
                 if (profilerData.config.enableWorkgroupAnalysis) {
                   const analysis = workgroupAnalyzer.analyzeDispatch(dispatchRecord);
-                  if (analysis && analysis.score < 70) {
+                  if (analysis) {
                     dispatchRecord.occupancyAnalysis = analysis;
-                    console.warn(`[WebSight] Suboptimal workgroup config for "${pipeline.label}" (Score: ${analysis.score})`);
-                    console.log('Issues:', analysis.issues.map(i => i.message));
+                    
+                    // CRITICAL: Send to UI logs instead of console
+                    const criticalIssues = analysis.issues.filter(i => i.severity === 'critical');
+                    if (criticalIssues.length > 0) {
+                      const criticalMsg = `CRITICAL DISPATCH ERROR for "${pipeline.label}"`;
+                      const details = [
+                        `Dispatch: [${dispatchRecord.dispatchSize.join(', ')}]`,
+                        `Workgroup: [${dispatchRecord.workgroupSize.join(', ')}]`,
+                        `Score: ${analysis.score}/100`,
+                        '',
+                        ...criticalIssues.map(issue => 
+                          `${issue.message}\n   ${issue.impact}\n   FIX: ${issue.recommendation}`
+                        )
+                      ].join('\n   ');
+                      
+                      profilerData.logs.push({
+                        timestamp: Date.now(),
+                        level: 'error',
+                        category: 'dispatch-geometry',
+                        message: criticalMsg,
+                        details: details
+                      });
+                      
+                      // Also trigger immediate broadcast for critical issues
+                      broadcastData();
+                    } else if (analysis.score < 70) {
+                      const warningMsg = `Suboptimal workgroup config for "${pipeline.label}" (Score: ${analysis.score})`;
+                      const issueList = analysis.issues.map(i => i.message).join(', ');
+                      
+                      profilerData.logs.push({
+                        timestamp: Date.now(),
+                        level: 'warning',
+                        category: 'workgroup-analysis',
+                        message: warningMsg,
+                        details: issueList
+                      });
+                    }
                   }
                 }
 
@@ -2055,7 +2284,7 @@
             // Disable GPU timing and increase broadcast interval
             profilerData.timingMode = 'cpu';
             profilerData.config.broadcastDebounceMs = 10000; // 10 seconds
-            console.log('[WebSight] ⚡ MINIMAL OVERHEAD MODE: GPU timing disabled, broadcast interval 10s');
+            console.log('[WebSight] MINIMAL OVERHEAD MODE: GPU timing disabled, broadcast interval 10s');
           } else {
             profilerData.timingMode = 'gpu';
             profilerData.config.broadcastDebounceMs = 1000;
@@ -2214,6 +2443,8 @@
               console.log(`\n  Kernel: ${a.kernelId}`);
               console.log(`  Score: ${a.score}/100`);
               console.log(`  Workgroup Size: [${a.workgroupSize.join(', ')}] = ${a.totalThreads} threads`);
+              console.log(`  Dispatch Size: [${a.dispatchSize.join(', ')}] = ${a.totalWorkgroups} workgroups`);
+              console.log(`  Total Invocations: ${a.totalInvocations.toLocaleString()}`);
               console.log(`  Potential Speedup: ${a.potentialSpeedup}`);
               console.log('  Issues:');
               a.issues.forEach(issue => {
