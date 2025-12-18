@@ -472,6 +472,23 @@
             
             if (dispatches.length === 0) return;
             
+            // DEBUG: Check bandwidth data
+            console.log('=== BANDWIDTH DEBUG ===');
+            console.log('Total dispatches:', dispatches.length);
+            console.log('Dispatches with bandwidth:', dispatches.filter(d => d.bandwidth).length);
+            dispatches.forEach((d, i) => {
+                if (d.bandwidth) {
+                    console.log(`Dispatch ${i}:`, {
+                        label: d.pipelineLabel,
+                        bandwidthGBs: d.bandwidth.bandwidthGBs,
+                        totalBytes: d.bandwidth.totalBytes,
+                        timingSource: d.timingSource
+                    });
+                } else {
+                    console.log(`Dispatch ${i}: NO BANDWIDTH DATA`);
+                }
+            });
+            
             // Group dispatches by largest data buffer size for bandwidth analysis
             const sizeGroups = new Map();
             
@@ -492,9 +509,11 @@
                 });
                 
                 // Use largest data buffer as proxy for working set size
+                // For render passes with no buffers, use framebuffer size from bandwidth.totalBytes
                 const largestBuffer = dataBuffers.length > 0 
                     ? Math.max(...dataBuffers.map(b => b.size || 0))
-                    : (buffers.length > 0 ? Math.max(...buffers.map(b => b.size || 0)) : 0);
+                    : (buffers.length > 0 ? Math.max(...buffers.map(b => b.size || 0)) : 
+                       (d.bandwidth?.totalBytes || 0)); // Use framebuffer bandwidth as size
                 
                 if (!sizeGroups.has(largestBuffer)) {
                     sizeGroups.set(largestBuffer, []);
@@ -502,46 +521,50 @@
                 sizeGroups.get(largestBuffer).push(d);
             });
             
-            // Create data points by summing dispatches with same buffer size
+            // Create data points from profiler's bandwidth data (no recalculation!)
             const dataPoints = [];
             sizeGroups.forEach((dispatches, largestBuffer) => {
                 const inputBytes = largestBuffer;
                 const inputSizeMB = inputBytes / (1024 * 1024);
                 
-                // Calculate bytes transferred (read + write)
-                const bytesTransferred = largestBuffer * 2;
+                // Separate GPU and CPU timed dispatches
+                const gpuDispatches = dispatches.filter(d => d.timingSource === 'gpu_timestamp' && d.bandwidth);
+                const cpuDispatches = dispatches.filter(d => d.timingSource === 'cpu_timing' && d.bandwidth);
                 
-                // Separate GPU and CPU calculations
-                const gpuDispatches = dispatches.filter(d => d.timingSource === 'gpu_timestamp');
-                const useGpuTiming = gpuDispatches.length > 0;
+                // Use profiler's pre-calculated bandwidth (average across dispatches in this group)
+                const gpuBandwidth = gpuDispatches.length > 0
+                    ? gpuDispatches.reduce((sum, d) => sum + d.bandwidth.bandwidthGBs, 0) / gpuDispatches.length
+                    : 0;
                 
-                // Sum times for all dispatches with same buffer size
-                const totalGpuTimeNs = useGpuTiming
-                    ? gpuDispatches.reduce((sum, d) => sum + (d.gpuTimeNs || 0), 0)
-                    : dispatches.reduce((sum, d) => sum + (d.cpuTimeNs || 0), 0);
+                const cpuBandwidth = cpuDispatches.length > 0
+                    ? cpuDispatches.reduce((sum, d) => sum + d.bandwidth.bandwidthGBs, 0) / cpuDispatches.length
+                    : 0;
                 
-                const totalCpuTimeNs = dispatches.reduce((sum, d) => sum + (d.cpuTimeNs || 0), 0);
+                // Get total time (for time graph)
+                const totalGpuTimeNs = gpuDispatches.reduce((sum, d) => sum + (d.gpuTimeNs || 0), 0);
+                const totalCpuTimeNs = cpuDispatches.reduce((sum, d) => sum + (d.cpuTimeNs || 0), 0);
                 
-                // Calculate bandwidth: GB/s = bytesTransferred / time_ns
-                const gpuBandwidth = totalGpuTimeNs > 0 ? bytesTransferred / totalGpuTimeNs : 0;
-                const cpuBandwidth = totalCpuTimeNs > 0 ? bytesTransferred / totalCpuTimeNs : 0;
+                // Only add GPU data point if we have GPU timing
+                if (gpuDispatches.length > 0) {
+                    dataPoints.push({
+                        inputSizeMB,
+                        inputBytes,
+                        time: totalGpuTimeNs,
+                        bandwidth: gpuBandwidth,  // Direct from profiler!
+                        timing: 'GPU'
+                    });
+                }
                 
-                // Create two data points (one for GPU, one for CPU)
-                dataPoints.push({
-                    inputSizeMB,
-                    inputBytes,
-                    time: totalGpuTimeNs,
-                    bandwidth: gpuBandwidth,
-                    timing: 'GPU'
-                });
-                
-                dataPoints.push({
-                    inputSizeMB,
-                    inputBytes,
-                    time: totalCpuTimeNs,
-                    bandwidth: cpuBandwidth,
-                    timing: 'CPU'
-                });
+                // Only add CPU data point if we have CPU timing (fallback)
+                if (cpuDispatches.length > 0) {
+                    dataPoints.push({
+                        inputSizeMB,
+                        inputBytes,
+                        time: totalCpuTimeNs,
+                        bandwidth: cpuBandwidth,  // Direct from profiler!
+                        timing: 'CPU'
+                    });
+                }
             });
             
             // Sort by input size for proper line connections
@@ -559,6 +582,14 @@
             
             // Check if GPU timing is available
             const hasGpuTiming = gpuData.some(d => d.time > 0 && d.time !== cpuData.find(c => c.inputBytes === d.inputBytes)?.time);
+            
+            // DEBUG: Log graph data
+            console.log('=== GRAPH DATA ===');
+            console.log('Data points:', dataPoints.length);
+            console.log('GPU data points:', gpuData.length);
+            console.log('Input sizes:', inputSizes);
+            console.log('GPU bandwidth values:', gpuBandwidth);
+            console.log('Has GPU timing:', hasGpuTiming);
             
             // Plot Bandwidth vs Input Size
             const bandwidthTraces = [

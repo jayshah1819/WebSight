@@ -1228,6 +1228,249 @@
     broadcastData();
   }
 
+  function analyzeMemoryAccessPattern(shaderCode, bufferAccesses, workgroupSize, dispatchSize) {
+    const analysis = {
+        accessPatternType: 'unknown',
+        estimatedAccessRatio: 1.0,  // How much of buffer is actually accessed
+        coalesced: true,
+        cacheEfficiency: 'unknown',
+        warnings: []
+    };
+
+    if (!shaderCode) return analysis;
+
+    // Pattern 1: Sequential access (GOOD - 100% efficiency)
+    // Matches: data[global_id.x], data[workgroup_id.x * size]
+    if (/data\s*\[\s*global_id\s*\.\s*x\s*\]/.test(shaderCode) ||
+        /\[\s*workgroup_id\s*\.\s*x\s*\*/.test(shaderCode)) {
+        analysis.accessPatternType = 'sequential';
+        analysis.coalesced = true;
+        analysis.cacheEfficiency = 'high';
+        analysis.estimatedAccessRatio = 1.0;
+    }
+
+    // Pattern 2: Strided access (BAD - reduced efficiency)
+    // Matches: data[i * stride] where stride > 1
+    if (/\[\s*\w+\s*\*\s*\d+\s*\]/.test(shaderCode) && !/\*\s*1\s*\]/.test(shaderCode)) {
+        const strideMatch = shaderCode.match(/\*\s*(\d+)/);
+        const stride = strideMatch ? parseInt(strideMatch[1]) : 4;
+        analysis.accessPatternType = 'strided';
+        analysis.coalesced = false;
+        analysis.cacheEfficiency = 'low';
+        analysis.warnings.push(`Strided access (stride ~${stride}) - poor coalescing`);
+        // Strided access only touches fraction of buffer
+        analysis.estimatedAccessRatio = 1.0 / Math.max(1, stride * 0.25);
+    }
+
+    // Pattern 3: Random/indirect access (VERY BAD)
+    // Matches: data[indices[i]]
+    if (/\[\s*\w+\s*\[\s*\w+\s*\]\s*\]/.test(shaderCode)) {
+        analysis.accessPatternType = 'random';
+        analysis.coalesced = false;
+        analysis.cacheEfficiency = 'very-low';
+        analysis.warnings.push('Random/indirect access - severe bandwidth penalty');
+        analysis.estimatedAccessRatio = 0.3;  // Conservative estimate
+    }
+
+    // Pattern 4: Shared memory usage (GOOD - reduces global memory traffic)
+    if (/var\s*<\s*workgroup\s*>/.test(shaderCode)) {
+        analysis.warnings.push(' Using shared memory - reduced traffic');
+        const workgroupThreads = workgroupSize.reduce((a, b) => a * b, 1);
+        if (workgroupThreads >= 64) {
+            analysis.estimatedAccessRatio *= 0.5;  // 50% reduction
+        }
+    }
+
+    // Pattern 5: Compute-heavy detection
+    const mathOps = (shaderCode.match(/\b(sin|cos|tan|exp|log|pow|sqrt)\s*\(/g) || []).length;
+    const memoryOps = (shaderCode.match(/\[\s*\w+\s*\]/g) || []).length;
+    
+    if (mathOps > memoryOps * 3) {
+        analysis.warnings.push('Compute-heavy kernel - bandwidth not bottleneck');
+    }
+
+    // Calculate bytes per thread
+    const totalThreads = workgroupSize.reduce((a, b) => a * b, 1) * 
+                        dispatchSize.reduce((a, b) => a * b, 1);
+    const totalBufferSize = bufferAccesses.reduce((sum, b) => sum + b.size, 0);
+    const bytesPerThread = totalBufferSize / Math.max(1, totalThreads);
+    
+    if (bytesPerThread < 8) {
+        analysis.warnings.push('Low bytes/thread - overhead dominates');
+    }
+
+    return analysis;
+  }
+
+  function calculateTextureSize(textureView) {
+    // Helper to calculate texture memory size
+    const texture = textureView.__websight_texture;
+    
+    if (!texture) return 0;
+    
+    const formatBytesPerPixel = {
+        'r8unorm': 1, 'r8snorm': 1, 'r8uint': 1, 'r8sint': 1,
+        'r16uint': 2, 'r16sint': 2, 'r16float': 2, 'rg8unorm': 2, 'rg8snorm': 2,
+        'r32uint': 4, 'r32sint': 4, 'r32float': 4, 'rg16uint': 4, 'rg16sint': 4, 'rg16float': 4,
+        'rgba8unorm': 4, 'rgba8unorm-srgb': 4, 'rgba8snorm': 4, 'rgba8uint': 4, 'rgba8sint': 4,
+        'bgra8unorm': 4, 'bgra8unorm-srgb': 4,
+        'rgb10a2unorm': 4, 'rg11b10ufloat': 4,
+        'rg32uint': 8, 'rg32sint': 8, 'rg32float': 8, 'rgba16uint': 8, 'rgba16sint': 8, 'rgba16float': 8,
+        'rgba32uint': 16, 'rgba32sint': 16, 'rgba32float': 16,
+        'depth32float': 4, 'depth24plus': 4, 'depth24plus-stencil8': 5, 'depth32float-stencil8': 5,
+        // Compressed formats (approximation)
+        'bc1-rgba-unorm': 0.5, 'bc1-rgba-unorm-srgb': 0.5,
+        'bc7-rgba-unorm': 1, 'bc7-rgba-unorm-srgb': 1,
+        'etc2-rgb8unorm': 0.5, 'etc2-rgb8unorm-srgb': 0.5,
+        'astc-4x4-unorm': 1, 'astc-4x4-unorm-srgb': 1
+    };
+    
+    const bytesPerPixel = formatBytesPerPixel[texture.format] || 4;
+    const width = texture.width || 1;
+    const height = texture.height || 1;
+    const depth = texture.depthOrArrayLayers || 1;
+    const mipLevels = texture.mipLevelCount || 1;
+    
+    let totalSize = 0;
+    for (let mip = 0; mip < mipLevels; mip++) {
+        const mipWidth = Math.max(1, width >> mip);
+        const mipHeight = Math.max(1, height >> mip);
+        totalSize += mipWidth * mipHeight * depth * bytesPerPixel;
+    }
+    
+    return totalSize;
+  }
+
+  function calculateFramebufferBandwidth(passDescriptor, vertexCount, instanceCount) {
+    let totalBytesRead = 0;
+    let totalBytesWritten = 0;
+    
+    if (!passDescriptor) return { bytesRead: 0, bytesWritten: 0 };
+    
+    const colorAttachments = passDescriptor.colorAttachments || [];
+    const depthAttachment = passDescriptor.depthStencilAttachment;
+    
+    // Calculate framebuffer bandwidth from render targets
+    colorAttachments.forEach((attachment, idx) => {
+        if (attachment && attachment.view) {
+            let attachmentBytes = calculateTextureSize(attachment.view);
+            
+            // Fallback: if texture metadata not available (e.g., canvas texture), 
+            // try to infer from view or use conservative estimate
+            if (attachmentBytes === 0) {
+                // Try multiple ways to get texture dimensions
+                const view = attachment.view;
+                let width, height;
+                
+                // Method 1: Check if view has texture property (non-standard but common)
+                if (view.texture) {
+                    width = view.texture.width;
+                    height = view.texture.height;
+                }
+                
+                // Method 2: Check descriptor (if view was created with explicit dimensions)
+                if (!width && view.descriptor) {
+                    width = view.descriptor.size?.width;
+                    height = view.descriptor.size?.height;
+                }
+                
+                // Method 3: Check internal properties (Chrome/WebKit specific)
+                if (!width && view.__texture) {
+                    width = view.__texture.width;
+                    height = view.__texture.height;
+                }
+                
+                if (width && height) {
+                    const bytesPerPixel = 4; // RGBA8 typical for canvas
+                    attachmentBytes = width * height * bytesPerPixel;
+                } else {
+                    // Last resort: assume 800x600 (common default canvas size)
+                    width = 800;
+                    height = 600;
+                    const bytesPerPixel = 4;
+                    attachmentBytes = width * height * bytesPerPixel;
+                }
+            }
+            
+            // Always write to color attachment
+            totalBytesWritten += attachmentBytes;
+            
+            // Read if blending or loading previous contents
+            if (attachment.loadOp === 'load') {
+                totalBytesRead += attachmentBytes;
+            }
+        }
+    });
+    
+    // Depth/stencil bandwidth
+    if (depthAttachment && depthAttachment.view) {
+        const depthBytes = calculateTextureSize(depthAttachment.view);
+        
+        totalBytesWritten += depthBytes;
+        if (depthAttachment.depthLoadOp === 'load') {
+            totalBytesRead += depthBytes;
+        }
+    }
+    
+    return { bytesRead: totalBytesRead, bytesWritten: totalBytesWritten };
+  }
+
+  class BandwidthTracker {
+    constructor() {
+      this.passResources = new Map(); // Tracks resources actively bound in current pass
+      this.totalBytesRead = 0;
+      this.totalBytesWritten = 0;
+    }
+
+    // Call this when intercepting setBindGroup
+    trackBindGroup(bindGroup, bindGroupLayout) {
+        if (!bindGroup || !bindGroup.__websight_resources) return;
+        
+        bindGroup.__websight_resources.forEach(res => {
+            // Track which resources are ACTUALLY bound in this pass
+            if (!this.passResources.has(res.id)) {
+                this.passResources.set(res.id, {
+                    size: res.size,
+                    type: res.type,
+                    usage: res.usage,
+                    accessType: res.accessType
+                });
+                
+                // Accumulate based on access pattern
+                if (res.accessType === 'read-only') {
+                    this.totalBytesRead += res.size;
+                } else if (res.accessType === 'write-only') {
+                    this.totalBytesWritten += res.size;
+                } else if (res.accessType === 'read-write') {
+                    this.totalBytesRead += res.size;
+                    this.totalBytesWritten += res.size;
+                }
+            }
+        });
+    }
+
+    calculateBandwidth(durationNs) {
+        const totalBytes = this.totalBytesRead + this.totalBytesWritten;
+        const durationSec = durationNs / 1e9;
+        const gb = totalBytes / (1024 ** 3);
+        
+        return {
+            bytesRead: this.totalBytesRead,
+            bytesWritten: this.totalBytesWritten,
+            totalBytes: totalBytes,
+            totalDataMB: (totalBytes / (1024 ** 2)).toFixed(2),
+            bandwidthGBs: durationSec > 0 ? (gb / durationSec).toFixed(2) : 0,
+            resourceCount: this.passResources.size
+        };
+    }
+
+    reset() {
+        this.passResources.clear();
+        this.totalBytesRead = 0;
+        this.totalBytesWritten = 0;
+    }
+  }
+
   async function hookWebGPU() {
     if (!navigator.gpu) {
       addLog('WebGPU not available', 'error');
@@ -1240,6 +1483,50 @@
     if (!window.__webSightDevices) {
       window.__webSightDevices = [];
     }
+
+    // Hook HTMLCanvasElement.getContext to track canvas textures
+    const origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(contextType, ...args) {
+      const context = origGetContext.call(this, contextType, ...args);
+      
+      if (contextType === 'webgpu' && context) {
+        // Hook getCurrentTexture to track canvas textures
+        const origGetCurrentTexture = context.getCurrentTexture.bind(context);
+        context.getCurrentTexture = function() {
+          const texture = origGetCurrentTexture();
+          
+          // Add metadata to the texture (since it wasn't created via device.createTexture)
+          if (texture && !texture.__websight_id) {
+            const canvas = this.canvas;
+            texture.__websight_id = crypto.randomUUID();
+            texture.__websight_metadata = {
+              id: texture.__websight_id,
+              label: 'canvas_texture',
+              width: canvas.width,
+              height: canvas.height,
+              depthOrArrayLayers: 1,
+              mipLevelCount: 1,
+              format: navigator.gpu.getPreferredCanvasFormat(),
+              usage: GPUTextureUsage.RENDER_ATTACHMENT
+            };
+            
+            // Hook createView to link views back to texture
+            const origCreateView = texture.createView.bind(texture);
+            texture.createView = function(viewDesc) {
+              const view = origCreateView(viewDesc);
+              view.__websight_texture = texture.__websight_metadata;
+              return view;
+            };
+            
+            console.log('[WebSight] Tracked canvas texture:', texture.__websight_metadata);
+          }
+          
+          return texture;
+        };
+      }
+      
+      return context;
+    };
 
     const originalRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
     
@@ -1431,16 +1718,111 @@
             return buffer;
           };
 
-          // Hook createBindGroup
+          // Hook createTexture to store metadata for bandwidth calculation
+          const origCreateTexture = device.createTexture.bind(device);
+          device.createTexture = function(desc) {
+            const texture = origCreateTexture(desc);
+            const textureId = crypto.randomUUID();
+            
+            texture.__websight_id = textureId;
+            texture.__websight_metadata = {
+              id: textureId,
+              label: desc.label || 'texture',
+              width: desc.size.width,
+              height: desc.size.height,
+              depthOrArrayLayers: desc.size.depthOrArrayLayers || 1,
+              mipLevelCount: desc.mipLevelCount || 1,
+              format: desc.format,
+              usage: desc.usage
+            };
+            
+            // Hook createView to link views back to texture
+            const origCreateView = texture.createView.bind(texture);
+            texture.createView = function(viewDesc) {
+              const view = origCreateView(viewDesc);
+              view.__websight_texture = texture.__websight_metadata;
+              return view;
+            };
+            
+            // Track for memory leak detection
+            const formatBytesPerPixel = {
+              'rgba8unorm': 4, 'rgba8unorm-srgb': 4, 'bgra8unorm': 4,
+              'rgba16float': 8, 'rgba32float': 16,
+              'depth32float': 4, 'depth24plus': 4
+            };
+            const bytesPerPixel = formatBytesPerPixel[desc.format] || 4;
+            const textureSize = desc.size.width * desc.size.height * 
+                               (desc.size.depthOrArrayLayers || 1) * bytesPerPixel;
+            memoryLeakDetector.trackResource(texture, 'GPUTexture', textureSize);
+            
+            // Hook destroy
+            const origDestroy = texture.destroy.bind(texture);
+            texture.destroy = function() {
+              memoryLeakDetector.markDestroyed(texture);
+              origDestroy();
+            };
+            
+            return texture;
+          };
+
+          // Hook createBindGroup to track resources with access patterns
           const origCreateBindGroup = device.createBindGroup.bind(device);
           device.createBindGroup = function(desc) {
             const bg = origCreateBindGroup(desc);
+            
+            // Store resource metadata for bandwidth tracking
+            bg.__websight_resources = [];
             bg.__capture = {
-              entries: desc.entries.map(e => ({ 
-                binding: e.binding, 
-                resource: e.resource.buffer?.__capture || e.resource 
-              }))
+              entries: desc.entries.map(e => {
+                let resource = null;
+                let accessType = 'read-only'; // Default assumption
+                
+                if (e.resource.buffer) {
+                  const buffer = e.resource.buffer;
+                  const usage = buffer.__capture?.usage || 0;
+                  
+                  // Determine access type from buffer usage
+                  if (usage & GPUBufferUsage.STORAGE) {
+                    accessType = 'read-write'; // Storage buffers can be read-write
+                  } else if (usage & GPUBufferUsage.UNIFORM) {
+                    accessType = 'read-only'; // Uniforms are always read-only
+                  }
+                  
+                  resource = {
+                    id: buffer.__capture?.id || crypto.randomUUID(),
+                    size: e.resource.size || buffer.size || 0,
+                    type: 'buffer',
+                    usage: usage,
+                    accessType: accessType
+                  };
+                  
+                  bg.__websight_resources.push(resource);
+                } else if (e.resource instanceof GPUTextureView || e.resource.texture) {
+                  const textureView = e.resource;
+                  const textureSize = calculateTextureSize(textureView);
+                  
+                  // Textures in fragment shader = read-only (samplers)
+                  // Textures in compute = could be read-write (storage textures)
+                  accessType = 'read-only'; // Conservative default
+                  
+                  resource = {
+                    id: textureView.__websight_texture?.id || crypto.randomUUID(),
+                    size: textureSize,
+                    type: 'texture',
+                    usage: 0,
+                    accessType: accessType
+                  };
+                  
+                  bg.__websight_resources.push(resource);
+                }
+                
+                return { 
+                  binding: e.binding, 
+                  resource: resource || (e.resource.buffer?.__capture || e.resource)
+                };
+              })
             };
+            
             return bg;
           };
 
@@ -1647,6 +2029,7 @@
               pass.__timingHelper = passTimingHelper; // Store on pass for later
               pass.__passType = 'compute';
               pass.__deviceLabel = device.__webSightInfo.label;
+              pass.__bandwidthTracker = new BandwidthTracker(); // Track bandwidth per pass
 
               const origSetPipeline = pass.setPipeline.bind(pass);
               pass.setPipeline = function(p) {
@@ -1657,6 +2040,8 @@
               const origSetBindGroup = pass.setBindGroup.bind(pass);
               pass.setBindGroup = function(i, bg) {
                 this.__boundBindGroups[i] = bg;
+                // Track resources for bandwidth calculation
+                this.__bandwidthTracker.trackBindGroup(bg);
                 origSetBindGroup(i, bg);
               };
 
@@ -1771,13 +2156,33 @@
                   timestampEnd: -1,
                   deviceLabel: device.__webSightInfo.label, // Multi-GPU tracking
                   passType: 'compute',
-                  dimensionViolation: dimensionViolation, // Mark failed dispatches
-                  bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
-                    bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
-                      ...profilerData.buffers[e.resource.id],
-                      binding: e.binding
-                    })) || []
-                  )
+                  dimensionViolation: dimensionViolation // Mark failed dispatches
+                };
+
+                // Calculate bandwidth using BandwidthTracker (already tracked via setBindGroup)
+                const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(cpuTimeNs);
+                
+                // Get buffer details for display (lighter weight - just for UI)
+                const bufferAccesses = Object.values(this.__boundBindGroups).flatMap(bg =>
+                    bg.__websight_resources || []
+                ).map(res => ({
+                    id: res.id,
+                    size: res.size,
+                    type: res.type,
+                    accessType: res.accessType
+                }));
+
+                // Add to dispatch record
+                dispatchRecord.bufferAccesses = bufferAccesses;
+                
+                // Bandwidth metrics from BandwidthTracker
+                dispatchRecord.bandwidth = {
+                    bytesRead: bandwidthStats.bytesRead,
+                    bytesWritten: bandwidthStats.bytesWritten,
+                    totalBytes: bandwidthStats.totalBytes,
+                    bandwidthGBs: parseFloat(bandwidthStats.bandwidthGBs) || 0,
+                    arithmeticIntensity: 0,  // FLOPs per byte (optional manual annotation)
+                    resourceCount: bandwidthStats.resourceCount
                 };
                 
                 if (profilerData.config.enableWorkgroupAnalysis) {
@@ -1888,6 +2293,8 @@
                 pass.__passType = 'render';
                 pass.__timingHelper = passTimingHelper; // Store for later timing retrieval
                 pass.__deviceLabel = device.__webSightInfo.label;
+                pass.__passDescriptor = passDesc; // Store pass descriptor for bandwidth calculation
+                pass.__bandwidthTracker = new BandwidthTracker(); // Track bandwidth per pass
 
                 // Track render pass operations (draw calls instead of dispatches)
                 const origSetPipeline = pass.setPipeline.bind(pass);
@@ -1899,12 +2306,15 @@
                 const origSetBindGroup = pass.setBindGroup.bind(pass);
                 pass.setBindGroup = function(i, bg) {
                   this.__boundBindGroups[i] = bg;
+                  // Track resources for bandwidth calculation
+                  this.__bandwidthTracker.trackBindGroup(bg);
                   origSetBindGroup(i, bg);
                 };
 
                 // Track draw calls as "dispatches" for consistency
                 const origDraw = pass.draw.bind(pass);
                 pass.draw = function(vertexCount, instanceCount, firstVertex, firstInstance) {
+                  const cpuStart = performance.now();
                   const pipeline = this.__boundPipeline?.__capture;
                   
                   const drawRecord = {
@@ -1915,26 +2325,48 @@
                     firstVertex: firstVertex || 0,
                     firstInstance: firstInstance || 0,
                     pipelineLabel: pipeline?.label || 'unknown',
-                    cpuStart: performance.now(),
+                    cpuStart: cpuStart,
                     cpuEnd: 0,
                     cpuTimeNs: 0,
                     gpuTimeNs: 0,
                     timingSource: 'render_pass_timing',
                     deviceLabel: device.__webSightInfo.label,
                     passType: 'render',
-                    bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
-                      bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
-                        ...profilerData.buffers[e.resource.id],
-                        binding: e.binding
-                      })) || []
-                    )
+                    bufferAccesses: []
                   };
 
                   origDraw(vertexCount, instanceCount, firstVertex, firstInstance);
                   
                   drawRecord.cpuEnd = performance.now();
-                  drawRecord.cpuTimeNs = (drawRecord.cpuEnd - drawRecord.cpuStart) * 1000000;
+                  const cpuTimeMs = drawRecord.cpuEnd - drawRecord.cpuStart;
+                  drawRecord.cpuTimeNs = cpuTimeMs * 1000000;
                   drawRecord.gpuTimeNs = drawRecord.cpuTimeNs; // Default to CPU time
+
+                  // Get bandwidth from tracker + framebuffer
+                  const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(cpuTimeMs * 1000000);
+                  let totalBytesRead = bandwidthStats.bytesRead;
+                  let totalBytesWritten = bandwidthStats.bytesWritten;
+                  
+                  // ALWAYS add framebuffer bandwidth for render passes
+                  const passDesc = this.__passDescriptor;
+                  const fbBandwidth = calculateFramebufferBandwidth(passDesc, vertexCount, instanceCount);
+                  totalBytesRead += fbBandwidth.bytesRead;
+                  totalBytesWritten += fbBandwidth.bytesWritten;
+
+                  const totalBytes = totalBytesRead + totalBytesWritten;
+                  
+                  // Add bandwidth metrics
+                  const bandwidthGBs = (totalBytes > 0 && cpuTimeMs > 0) 
+                      ? totalBytes / (cpuTimeMs / 1000) / (1024 ** 3) 
+                      : 0;
+                      
+                  drawRecord.bandwidth = {
+                      bytesRead: totalBytesRead,
+                      bytesWritten: totalBytesWritten,
+                      totalBytes: totalBytes,
+                      bandwidthGBs: bandwidthGBs,
+                      arithmeticIntensity: 0
+                  };
 
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
@@ -1946,6 +2378,7 @@
 
                 const origDrawIndexed = pass.drawIndexed.bind(pass);
                 pass.drawIndexed = function(indexCount, instanceCount, firstIndex, baseVertex, firstInstance) {
+                  const cpuStart = performance.now();
                   const pipeline = this.__boundPipeline?.__capture;
                   
                   const drawRecord = {
@@ -1957,26 +2390,48 @@
                     baseVertex: baseVertex || 0,
                     firstInstance: firstInstance || 0,
                     pipelineLabel: pipeline?.label || 'unknown',
-                    cpuStart: performance.now(),
+                    cpuStart: cpuStart,
                     cpuEnd: 0,
                     cpuTimeNs: 0,
                     gpuTimeNs: 0,
                     timingSource: 'render_pass_timing',
                     deviceLabel: device.__webSightInfo.label,
                     passType: 'render',
-                    bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
-                      bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
-                        ...profilerData.buffers[e.resource.id],
-                        binding: e.binding
-                      })) || []
-                    )
+                    bufferAccesses: []
                   };
 
                   origDrawIndexed(indexCount, instanceCount, firstIndex, baseVertex, firstInstance);
                   
                   drawRecord.cpuEnd = performance.now();
-                  drawRecord.cpuTimeNs = (drawRecord.cpuEnd - drawRecord.cpuStart) * 1000000;
+                  const cpuTimeMs = drawRecord.cpuEnd - drawRecord.cpuStart;
+                  drawRecord.cpuTimeNs = cpuTimeMs * 1000000;
                   drawRecord.gpuTimeNs = drawRecord.cpuTimeNs;
+
+                  // Get bandwidth from tracker + framebuffer
+                  const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(cpuTimeMs * 1000000);
+                  let totalBytesRead = bandwidthStats.bytesRead;
+                  let totalBytesWritten = bandwidthStats.bytesWritten;
+                  
+                  // ALWAYS add framebuffer bandwidth for render passes
+                  const passDesc = this.__passDescriptor;
+                  const fbBandwidth = calculateFramebufferBandwidth(passDesc, indexCount, instanceCount);
+                  totalBytesRead += fbBandwidth.bytesRead;
+                  totalBytesWritten += fbBandwidth.bytesWritten;
+                  
+                  const totalBytes = totalBytesRead + totalBytesWritten;
+                  
+                  // Add bandwidth metrics
+                  const bandwidthGBs = (totalBytes > 0 && cpuTimeMs > 0) 
+                      ? totalBytes / (cpuTimeMs / 1000) / (1024 ** 3) 
+                      : 0;
+                      
+                  drawRecord.bandwidth = {
+                      bytesRead: totalBytesRead,
+                      bytesWritten: totalBytesWritten,
+                      totalBytes: totalBytes,
+                      bandwidthGBs: bandwidthGBs,
+                      arithmeticIntensity: 0
+                  };
 
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
@@ -2113,15 +2568,27 @@
                     for (let i = 0; i < Math.min(allDurations.length, dispatchesInSubmit.length); i++) {
                       const dispatch = dispatchesInSubmit[i];
                       const gpuTimeNs = Number(allDurations[i]);
-                      
+
                       // Update dispatch with GPU timing
                       dispatch.gpuTimeNs = gpuTimeNs;
                       dispatch.gpuTimeUs = gpuTimeNs / 1000;
                       dispatch.gpuTimeMs = gpuTimeNs / 1000000;
                       dispatch.normalizedTime = normalizeTime(gpuTimeNs);
                       dispatch.timingSource = 'gpu_timestamp';
-                      
-                      // Update kernel stats
+
+                      // Recalculate bandwidth with ACCURATE GPU timing
+                      if (dispatch.bandwidth && gpuTimeNs > 0) {
+                          const gpuTimeSec = gpuTimeNs / 1e9;  // Convert to seconds
+                          dispatch.bandwidth.bandwidthGBs = dispatch.bandwidth.totalBytes / gpuTimeSec / (1024 ** 3);
+                          
+                          // Calculate memory efficiency (% of theoretical peak)
+                          if (device.limits.maxStorageBufferBindingSize) {
+                              const estimatedPeakBandwidth = 500;  // GB/s (conservative)
+                              dispatch.bandwidth.memoryEfficiency = (dispatch.bandwidth.bandwidthGBs / estimatedPeakBandwidth) * 100;
+                          }
+                      }
+
+                      // Update kernel stats with bandwidth
                       const kernel = profilerData.kernels[dispatch.kernelId];
                       if (kernel) {
                         // Replace CPU time with GPU time in totals
@@ -2129,6 +2596,28 @@
                         kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
                         kernel.stats.minTime = Math.min(kernel.stats.minTime, gpuTimeNs);
                         kernel.stats.maxTime = Math.max(kernel.stats.maxTime, gpuTimeNs);
+                        
+                        // NEW: Aggregate bandwidth stats per kernel
+                        if (!kernel.bandwidth) {
+                            kernel.bandwidth = {
+                                totalBytesRead: 0,
+                                totalBytesWritten: 0,
+                                totalBytes: 0,
+                                avgBandwidthGBs: 0,
+                                peakBandwidthGBs: 0
+                            };
+                        }
+                        
+                        if (dispatch.bandwidth) {
+                            kernel.bandwidth.totalBytesRead += dispatch.bandwidth.bytesRead;
+                            kernel.bandwidth.totalBytesWritten += dispatch.bandwidth.bytesWritten;
+                            kernel.bandwidth.totalBytes += dispatch.bandwidth.totalBytes;
+                            kernel.bandwidth.avgBandwidthGBs = kernel.bandwidth.totalBytes / (kernel.stats.totalTime / 1e9) / (1024 ** 3);
+                            kernel.bandwidth.peakBandwidthGBs = Math.max(
+                                kernel.bandwidth.peakBandwidthGBs || 0,
+                                dispatch.bandwidth.bandwidthGBs
+                            );
+                        }
                       }
                     }
                   }
@@ -2324,6 +2813,14 @@
           .map(d => d.gpuTimeNs);
         
         const unit = getTimeUnitLabel();
+
+        // Calculate total bandwidth
+        const totalBytesRead = dispatches.reduce((sum, d) => sum + (d.bandwidth?.bytesRead || 0), 0);
+        const totalBytesWritten = dispatches.reduce((sum, d) => sum + (d.bandwidth?.bytesWritten || 0), 0);
+        const totalBytes = totalBytesRead + totalBytesWritten;
+        const totalGpuTimeNs = validGpuTimes.reduce((a, b) => a + b, 0);
+        const avgBandwidthGBs = totalGpuTimeNs > 0 ? 
+            (totalBytes / (totalGpuTimeNs / 1e9) / (1024 ** 3)) : 0;
         
         return {
           totalDispatches: dispatches.length,
@@ -2341,12 +2838,168 @@
           maxGpuTime: validGpuTimes.length > 0
             ? normalizeTime(Math.max(...validGpuTimes))
             : 0,
-          timeUnit: unit
+          timeUnit: unit,
+          // NEW: Bandwidth statistics
+          bandwidth: {
+              totalBytesRead: totalBytesRead,
+              totalBytesWritten: totalBytesWritten,
+              totalBytes: totalBytes,
+              avgBandwidthGBs: avgBandwidthGBs,
+              peakBandwidthGBs: Math.max(...dispatches.map(d => d.bandwidth?.bandwidthGBs || 0)),
+              totalBytesReadMB: (totalBytesRead / (1024 ** 2)).toFixed(2),
+              totalBytesWrittenMB: (totalBytesWritten / (1024 ** 2)).toFixed(2),
+              totalBytesMB: (totalBytes / (1024 ** 2)).toFixed(2),
+              totalBytesReadGB: (totalBytesRead / (1024 ** 3)).toFixed(3),
+              totalBytesWrittenGB: (totalBytesWritten / (1024 ** 3)).toFixed(3),
+              totalBytesGB: (totalBytes / (1024 ** 3)).toFixed(3)
+          }
         };
       },
       
       getTimingHelperStats: () => {
         return { message: 'Each encoder now has its own TimingHelper. Stats are per-encoder.' };
+      },
+      
+      getBandwidthAnalysis: () => {
+        console.log('\n[WebSight] Bandwidth Analysis Report');
+        console.log('═'.repeat(80));
+
+        const dispatches = profilerData.dispatches.filter(d => 
+            d.bandwidth && d.timingSource === 'gpu_timestamp'
+        );
+        
+        if (dispatches.length === 0) {
+            console.log('\nWARNING: No GPU-timed dispatches with bandwidth data available.');
+            console.log('   Run your WebGPU application first.');
+            return null;
+        }
+
+        // Aggregate statistics
+        const totalBytesRead = dispatches.reduce((sum, d) => sum + d.bandwidth.bytesRead, 0);
+        const totalBytesWritten = dispatches.reduce((sum, d) => sum + d.bandwidth.bytesWritten, 0);
+        const totalBytes = totalBytesRead + totalBytesWritten;
+        const totalTimeNs = dispatches.reduce((sum, d) => sum + d.gpuTimeNs, 0);
+        const avgBandwidthGBs = totalBytes / (totalTimeNs / 1e9) / (1024 ** 3);
+        const peakBandwidthGBs = Math.max(...dispatches.map(d => d.bandwidth.bandwidthGBs));
+
+        // Per-kernel bandwidth aggregation
+        const kernelBandwidth = {};
+        dispatches.forEach(d => {
+            if (!kernelBandwidth[d.kernelId]) {
+                kernelBandwidth[d.kernelId] = {
+                    label: d.pipelineLabel,
+                    count: 0,
+                    totalBytes: 0,
+                    totalTimeNs: 0,
+                    peakBandwidthGBs: 0,
+                    memoryPatterns: []
+                };
+            }
+            const kb = kernelBandwidth[d.kernelId];
+            kb.count++;
+            kb.totalBytes += d.bandwidth.totalBytes;
+            kb.totalTimeNs += d.gpuTimeNs;
+            kb.peakBandwidthGBs = Math.max(kb.peakBandwidthGBs, d.bandwidth.bandwidthGBs);
+            
+            if (d.memoryPattern && !kb.memoryPatterns.includes(d.memoryPattern.type)) {
+                kb.memoryPatterns.push(d.memoryPattern.type);
+            }
+        });
+
+        // Calculate avg bandwidth per kernel
+        Object.values(kernelBandwidth).forEach(kb => {
+            kb.avgBandwidthGBs = kb.totalBytes / (kb.totalTimeNs / 1e9) / (1024 ** 3);
+        });
+
+        // Sort by total bandwidth
+        const sortedKernels = Object.values(kernelBandwidth)
+            .sort((a, b) => b.totalBytes - a.totalBytes);
+
+        console.log('\nOVERALL BANDWIDTH');
+        console.log('-'.repeat(80));
+        console.log(`Analyzed Dispatches: ${dispatches.length}`);
+        console.log(`Total Data Transferred: ${(totalBytes / (1024 ** 3)).toFixed(3)} GB`);
+        console.log(`  - Read:    ${(totalBytesRead / (1024 ** 3)).toFixed(3)} GB (${(totalBytesRead / totalBytes * 100).toFixed(1)}%)`);
+        console.log(`  - Written: ${(totalBytesWritten / (1024 ** 3)).toFixed(3)} GB (${(totalBytesWritten / totalBytes * 100).toFixed(1)}%)`);
+        console.log(`Total GPU Time: ${(totalTimeNs / 1e6).toFixed(2)} ms`);
+        console.log(`Average Bandwidth: ${avgBandwidthGBs.toFixed(2)} GB/s`);
+        console.log(`Peak Bandwidth: ${peakBandwidthGBs.toFixed(2)} GB/s`);
+
+        // Estimate memory efficiency
+        let estimatedPeakBW = 500;  // Conservative default
+        if (peakBandwidthGBs > 800) estimatedPeakBW = 1000;
+        else if (peakBandwidthGBs > 400) estimatedPeakBW = 600;
+        else if (peakBandwidthGBs > 200) estimatedPeakBW = 400;
+        
+        const memoryEfficiency = (avgBandwidthGBs / estimatedPeakBW * 100);
+        console.log(`\nEstimated Memory Efficiency: ${memoryEfficiency.toFixed(1)}% of ~${estimatedPeakBW} GB/s peak`);
+
+        if (memoryEfficiency < 20) {
+            console.log('\nWARNING: VERY LOW MEMORY UTILIZATION (<20%)');
+            console.log('   Kernels are compute-bound or have significant overhead.');
+        } else if (memoryEfficiency < 50) {
+            console.log('\nWARNING: LOW MEMORY UTILIZATION (20-50%)');
+            console.log('   Poor memory access patterns detected.');
+        } else if (memoryEfficiency > 70) {
+            console.log('\nHIGH MEMORY UTILIZATION (>70%) - Memory-bound workload');
+        }
+
+        console.log('\nTOP BANDWIDTH CONSUMERS');
+        console.log('-'.repeat(80));
+        console.log('Kernel'.padEnd(35) + 'Calls'.padEnd(8) + 'Total GB'.padEnd(12) + 'Avg GB/s'.padEnd(12) + 'Pattern');
+        console.log('-'.repeat(80));
+
+        sortedKernels.slice(0, 10).forEach(kb => {
+            console.log(
+                kb.label.padEnd(35).substring(0, 35) +
+                kb.count.toString().padEnd(8) +
+                (kb.totalBytes / (1024 ** 3)).toFixed(3).padEnd(12) +
+                kb.avgBandwidthGBs.toFixed(2).padEnd(12) +
+                kb.memoryPatterns.join(', ')
+            );
+        });
+
+        // Identify memory-bound kernels (>200 GB/s)
+        console.log('\nMEMORY-BOUND KERNELS (>200 GB/s)');
+        console.log('-'.repeat(80));
+        const memoryBound = sortedKernels.filter(kb => kb.avgBandwidthGBs > 200);
+        if (memoryBound.length > 0) {
+            memoryBound.forEach(kb => {
+                console.log(`  ${kb.label}: ${kb.avgBandwidthGBs.toFixed(2)} GB/s`);
+            });
+            console.log('\nOptimize by: using shared memory, coalescing accesses, reducing redundant reads');
+        } else {
+            console.log('   None - workload is compute-bound or low utilization.');
+        }
+
+        // Identify compute-bound kernels (<100 GB/s)
+        console.log('\nCOMPUTE-BOUND KERNELS (<100 GB/s)');
+        console.log('-'.repeat(80));
+        const computeBound = sortedKernels.filter(kb => kb.avgBandwidthGBs < 100);
+        if (computeBound.length > 0) {
+            computeBound.forEach(kb => {
+                console.log(`  ${kb.label}: ${kb.avgBandwidthGBs.toFixed(2)} GB/s`);
+            });
+            console.log('\nOptimize by: reducing math ops, using approximations, increasing workgroup size');
+        } else {
+            console.log('   None - all kernels are memory-bound.');
+        }
+
+        return {
+            overall: {
+                totalBytesRead,
+                totalBytesWritten,
+                totalBytes,
+                totalTimeMs: totalTimeNs / 1e6,
+                avgBandwidthGBs,
+                peakBandwidthGBs,
+                memoryEfficiency,
+                estimatedPeakBW
+            },
+            kernels: sortedKernels,
+            memoryBound,
+            computeBound
+        };
       },
       
       listKernels: () => {
@@ -2376,7 +3029,7 @@
       },
       
       // =========================================================================
-      // ADVANCED ANALYSIS API
+      // ADVANCED ANALYSIS API(pending)
       // =========================================================================
       
       // Memory Leak Detection
@@ -2489,7 +3142,7 @@
           console.log(`Critical Issues: ${summary.criticalIssues}`);
           
           if (summary.needsOptimization.length > 0) {
-            console.log(`\n🔧 ${summary.needsOptimization.length} Shader(s) Need Optimization:`);
+            console.log(`\n${summary.needsOptimization.length} Shader(s) Need Optimization:`);
             summary.needsOptimization.forEach(a => {
               console.log(`\n  Shader ID: ${a.shaderId}`);
               console.log(`  Score: ${a.score}/100 (Grade: ${a.grade.letter})`);
@@ -2549,14 +3202,14 @@
       
       // Get comprehensive analysis report
       getFullAnalysisReport: () => {
-        console.log('\n🚀 [WebSight] COMPREHENSIVE ANALYSIS REPORT');
+        console.log('\n[WebSight] COMPREHENSIVE ANALYSIS REPORT');
         console.log('═'.repeat(80));
         
         const memoryReport = memoryLeakDetector.getLeakReport();
         const workgroupReport = workgroupAnalyzer.getSummary();
         const shaderReport = shaderAnalyzer.getSummary();
         
-        console.log('\n SUMMARY');
+        console.log('\nSUMMARY');
         console.log('-'.repeat(80));
         console.log(`Memory: ${memoryLeakDetector.formatBytes(memoryReport.stats.currentMemory)} / Peak: ${memoryLeakDetector.formatBytes(memoryReport.stats.peakMemory)}`);
         console.log(`Potential Leaks: ${memoryReport.summary.totalLeaks} (${memoryReport.summary.leakRate})`);
@@ -2571,10 +3224,11 @@
           console.log(`Critical Shader Issues: ${shaderReport.criticalIssues}`);
         }
         
-        console.log('\n✨ Call specific methods for detailed reports:');
+        console.log('\nCall specific methods for detailed reports:');
         console.log('  - WebSight.getMemoryLeaks()');
         console.log('  - WebSight.getWorkgroupAnalysis()');
         console.log('  - WebSight.getShaderAnalysis()');
+        console.log('  - WebSight.getBandwidthAnalysis()');
         
         return {
           memory: memoryReport,

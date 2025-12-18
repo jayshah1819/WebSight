@@ -19,7 +19,7 @@ All without touching your application code. Just include the profiler, open the 
 ### 1. Add the profiler to your app
 
 ```html
-<script src="profiler-standalone.js"></script>
+<script src="WebSight/profiler-standalone.js"></script>
 ```
 
 That's it. WebSight automatically hooks into WebGPU when your page loads.
