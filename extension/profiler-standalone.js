@@ -190,21 +190,26 @@
         this.#state === "wait for result",
         `must call resolveTiming (state === ${this.#state})`
       );
-      this.#state = "free";
+      // Use "reading" state while mapAsync is pending to prevent the pool from
+      // re-issuing this helper. Setting "free" here would allow a concurrent
+      // encoder to acquire and reset() the helper mid-read, corrupting the
+      // result buffer and potentially causing GPU device loss.
+      this.#state = "reading";
 
-      /* prepare for next use */
       this.#passNumber = 0;
 
       const resultBuffer = this.#resultBuffer;
       await resultBuffer.mapAsync(GPUMapMode.READ);
-      const times = new BigInt64Array(resultBuffer.getMappedRange());
-      /* I need to read about functional programming in JS to make below pretty */
+      // GPU timestamps are unsigned 64-bit nanoseconds. BigInt64Array interprets
+      // the high bit as a sign bit, which can wrap around on some GPUs.
+      const times = new BigUint64Array(resultBuffer.getMappedRange());
       const durations = [];
       for (let idx = 0; idx < times.length; idx += 2) {
         durations.push(Number(times[idx + 1] - times[idx]));
       }
       resultBuffer.unmap();
       this.#resultBuffers.push(resultBuffer);
+      this.#state = "free";
       return durations;
     }
 
@@ -607,7 +612,11 @@
         analysis.potentialSpeedup = 'Already optimal';
       }
       
-      this.analyses.set(dispatch.kernelId, analysis);
+      // Keep worst-scoring analysis per kernel (not last-write-wins)
+      const existing = this.analyses.get(dispatch.kernelId);
+      if (!existing || analysis.score < existing.score) {
+        this.analyses.set(dispatch.kernelId, analysis);
+      }
       return analysis;
     }
     
@@ -852,25 +861,48 @@
       const branches = [];
       const lines = code.split('\n');
       
-      // Look for if statements inside loops
-      let inLoop = false;
+      // Track brace depth separately from loop depth so that closing braces
+      // for non-loop blocks (if/else/switch) don't incorrectly decrement
+      // the loop counter.
       let loopDepth = 0;
+      let braceStack = []; // entries: 'loop' | 'block'
       
       lines.forEach((line, idx) => {
-        if (/\bfor\b|\bwhile\b|\bloop\b/.test(line)) {
-          inLoop = true;
-          loopDepth++;
+        const trimmed = line.trim();
+        if (trimmed.startsWith('//')) return;
+        
+        const noComment = trimmed.replace(/\/\/.*$/, '');
+        const isLoopLine = /\b(for|while|loop)\b/.test(noComment);
+        
+        const opens = (noComment.match(/{/g) || []).length;
+        const closes = (noComment.match(/}/g) || []).length;
+        
+        let loopOpensUsed = 0;
+        for (let i = 0; i < opens; i++) {
+          if (isLoopLine && loopOpensUsed === 0) {
+            braceStack.push('loop');
+            loopDepth++;
+            loopOpensUsed++;
+          } else {
+            braceStack.push('block');
+          }
         }
-        if (inLoop && /\bif\b/.test(line) && !line.includes('//')) {
+        
+        if (loopDepth > 0 && /\bif\b/.test(noComment)) {
           branches.push({
             line: idx + 1,
-            code: line.trim(),
+            code: trimmed,
             inLoopDepth: loopDepth
           });
         }
-        if (line.includes('}') && loopDepth > 0) {
-          loopDepth--;
-          if (loopDepth === 0) inLoop = false;
+        
+        for (let i = 0; i < closes; i++) {
+          if (braceStack.length > 0) {
+            const popped = braceStack.pop();
+            if (popped === 'loop') {
+              loopDepth--;
+            }
+          }
         }
       });
       
@@ -907,8 +939,12 @@
       const lines = code.split('\n');
       
       lines.forEach((line, idx) => {
-        // Look for array[expression * stride] patterns
-        if (/\[\s*\w+\s*\*\s*\d+\s*\]/.test(line)) {
+        // Look for array[expression * stride] patterns.
+        // Only flag strides > 4 to stay consistent with
+        // analyzeMemoryAccessPattern — small strides (1-4) are
+        // typical vec4/matrix element access and coalesce fine.
+        const strideMatch = line.match(/\[\s*\w+\s*\*\s*(\d+)\s*\]/);
+        if (strideMatch && parseInt(strideMatch[1]) > 4) {
           patterns.push({
             line: idx + 1,
             code: line.trim(),
@@ -949,20 +985,51 @@
     
     analyzeLoops(code) {
       const lines = code.split('\n');
-      let depth = 0;
+      let loopDepth = 0;
       let maxDepth = 0;
       let total = 0;
       let nested = 0;
+      let braceStack = []; // entries: 'loop' | 'block'
       
       lines.forEach(line => {
-        if (/\bfor\b|\bwhile\b|\bloop\b/.test(line)) {
-          total++;
-          depth++;
-          if (depth > 1) nested++;
-          maxDepth = Math.max(maxDepth, depth);
+        const trimmed = line.trim();
+        // Skip full-line comments
+        if (trimmed.startsWith('//')) return;
+        
+        // Strip inline comments before analysis
+        const noComment = trimmed.replace(/\/\/.*$/, '');
+        
+        const isLoopLine = /\b(for|while|loop)\b/.test(noComment);
+        
+        // Count opening braces on this line
+        const opens = (noComment.match(/{/g) || []).length;
+        // Count closing braces on this line
+        const closes = (noComment.match(/}/g) || []).length;
+        
+        // Process opens: first open on a loop line is tagged 'loop',
+        // all others are 'block'.
+        let loopOpensUsed = 0;
+        for (let i = 0; i < opens; i++) {
+          if (isLoopLine && loopOpensUsed === 0) {
+            braceStack.push('loop');
+            loopDepth++;
+            total++;
+            if (loopDepth > 1) nested++;
+            maxDepth = Math.max(maxDepth, loopDepth);
+            loopOpensUsed++;
+          } else {
+            braceStack.push('block');
+          }
         }
-        if (line.includes('}')) {
-          depth = Math.max(0, depth - 1);
+        
+        // Process closes
+        for (let i = 0; i < closes; i++) {
+          if (braceStack.length > 0) {
+            const popped = braceStack.pop();
+            if (popped === 'loop') {
+              loopDepth--;
+            }
+          }
         }
       });
       
@@ -1372,8 +1439,12 @@
             };
             profilerData.buffers[bufferId] = buffer.__capture;
             
-            // Track for memory leak detection
-            memoryLeakDetector.trackResource(buffer, 'GPUBuffer', desc.size);
+            // Track for memory leak detection (skip profiler-internal buffers
+            // created by TimingHelper — their labels start with 'TimingHelper')
+            const isProfilerInternal = (desc.label || '').startsWith('TimingHelper');
+            if (!isProfilerInternal) {
+              memoryLeakDetector.trackResource(buffer, 'GPUBuffer', desc.size);
+            }
             
             // Hook destroy method
             const origDestroy = buffer.destroy.bind(buffer);
@@ -1421,7 +1492,8 @@
                 available: [], // Queue of helpers ready to use
                 inUse: new Set(), // Helpers currently in use
                 index: 0,
-                maxSize: 1, // Ultra-conservative: only 1 TimingHelper to avoid GPU QuerySet limits
+                maxSize: 8, // Allow up to 8 concurrent TimingHelpers for multi-pass encoders
+                            // GPU QuerySet limit errors are caught gracefully and cap actual count
                 passesPerHelper: 1, // 1 pass per helper = most reliable for rapid single-pass operations
                 failed: false, // Track if timing completely unavailable
                 limitReached: false // Track if we've hit the GPU QuerySet limit
@@ -1577,9 +1649,6 @@
               let passTimingHelper = null;
               if (profilerData.timingMode === 'gpu') {
                 passTimingHelper = getTimingHelper(device);
-                if (passTimingHelper) {
-                  passTimings.push(passTimingHelper);
-                }
                 // No error logging here - getTimingHelper already handles that
               }
               
@@ -1594,7 +1663,6 @@
                   console.warn('[WebSight] TimingHelper.beginComputePass failed, continuing without timing:', e.message);
                   pass = origBeginComputePass(passDesc);
                   passTimingHelper = null; // Don't track this failed helper
-                  passTimings.pop(); // Remove from passTimings array
                 }
               } else {
                 pass = origBeginComputePass(passDesc);
@@ -1604,6 +1672,15 @@
               device.__webSightInfo.passCount++; // Track per-device
               
               pass.__dispatches = [];
+              pass.__passId = crypto.randomUUID(); // Unique per-pass for dedup
+
+              // Associate this pass's timing helper with its dispatch records so
+              // GPU timing is correctly attributed to ALL dispatches in the pass,
+              // not just the first one (fixes multi-dispatch-per-pass timing).
+              if (passTimingHelper) {
+                passTimings.push({ helper: passTimingHelper, dispatches: pass.__dispatches });
+              }
+
               pass.__boundPipeline = null;
               pass.__boundBindGroups = {};
               pass.__timingHelper = passTimingHelper; // Store on pass for later
@@ -1666,16 +1743,17 @@
                   cpuTimeNs: cpuTimeNs,
                   cpuTimeUs: cpuTimeNs / 1000,
                   cpuTimeMs: cpuTimeMs,
-                  gpuTimeNs: cpuTimeNs, // Default to CPU time
-                  gpuTimeUs: cpuTimeNs / 1000,
-                  gpuTimeMs: cpuTimeMs,
-                  timingSource: 'cpu_timing',
+                  gpuTimeNs: 0, // Pending GPU timestamp
+                  gpuTimeUs: 0,
+                  gpuTimeMs: 0,
+                  timingSource: 'pending',
                   normalizedTime: normalizeTime(cpuTimeNs),
                   timeUnit: getTimeUnitLabel(),
                   timestampStart: -1,
                   timestampEnd: -1,
                   deviceLabel: device.__webSightInfo.label, // Multi-GPU tracking
                   passType: 'compute',
+                  passId: pass.__passId,
                   bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
                     bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
                       ...profilerData.buffers[e.resource.id],
@@ -1697,10 +1775,10 @@
                 const kernel = profilerData.kernels[kernelId];
                 if (kernel) {
                   kernel.stats.count++;
-                  kernel.stats.totalTime += dispatchRecord.gpuTimeNs;
-                  kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
-                  kernel.stats.minTime = Math.min(kernel.stats.minTime, dispatchRecord.gpuTimeNs);
-                  kernel.stats.maxTime = Math.max(kernel.stats.maxTime, dispatchRecord.gpuTimeNs);
+                  // Don't update time stats here — gpuTimeNs is 0 (pending).
+                  // Updating minTime with 0 would pin it to 0 permanently.
+                  // Time stats are updated in onSubmittedWorkDone when real
+                  // GPU timestamps arrive.
                 }
 
                 profilerData.dispatches.push(dispatchRecord);
@@ -1727,9 +1805,6 @@
                 let passTimingHelper = null;
                 if (profilerData.timingMode === 'gpu') {
                   passTimingHelper = getTimingHelper(device);
-                  if (passTimingHelper) {
-                    passTimings.push(passTimingHelper);
-                  }
                   // No error logging here - getTimingHelper already handles that
                 }
 
@@ -1744,7 +1819,6 @@
                     console.warn('[WebSight] TimingHelper.beginRenderPass failed, continuing without timing:', e.message);
                     pass = origBeginRenderPass(passDesc);
                     passTimingHelper = null; // Don't track this failed helper
-                    passTimings.pop(); // Remove from passTimings array
                   }
                 } else {
                   pass = origBeginRenderPass(passDesc);
@@ -1754,6 +1828,13 @@
                 device.__webSightInfo.passCount++; // Track per-device
 
                 pass.__dispatches = [];
+                pass.__passId = crypto.randomUUID(); // Unique per-pass for dedup
+
+                // Associate this pass's timing helper with its dispatch records
+                if (passTimingHelper) {
+                  passTimings.push({ helper: passTimingHelper, dispatches: pass.__dispatches });
+                }
+
                 pass.__boundBindGroups = {};
                 pass.__passType = 'render';
                 pass.__timingHelper = passTimingHelper; // Store for later timing retrieval
@@ -1792,6 +1873,7 @@
                     timingSource: 'render_pass_timing',
                     deviceLabel: device.__webSightInfo.label,
                     passType: 'render',
+                    passId: pass.__passId,
                     bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
                       bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
                         ...profilerData.buffers[e.resource.id],
@@ -1804,7 +1886,7 @@
                   
                   drawRecord.cpuEnd = performance.now();
                   drawRecord.cpuTimeNs = (drawRecord.cpuEnd - drawRecord.cpuStart) * 1000000;
-                  drawRecord.gpuTimeNs = drawRecord.cpuTimeNs; // Default to CPU time
+                  drawRecord.gpuTimeNs = 0; // Pending GPU timestamp
 
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
@@ -1834,6 +1916,7 @@
                     timingSource: 'render_pass_timing',
                     deviceLabel: device.__webSightInfo.label,
                     passType: 'render',
+                    passId: pass.__passId,
                     bufferAccesses: Object.values(this.__boundBindGroups).flatMap(bg => 
                       bg.__capture?.entries.filter(e => e.resource?.id).map(e => ({
                         ...profilerData.buffers[e.resource.id],
@@ -1846,7 +1929,7 @@
                   
                   drawRecord.cpuEnd = performance.now();
                   drawRecord.cpuTimeNs = (drawRecord.cpuEnd - drawRecord.cpuStart) * 1000000;
-                  drawRecord.gpuTimeNs = drawRecord.cpuTimeNs;
+                  drawRecord.gpuTimeNs = 0; // Pending GPU timestamp
 
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
@@ -1892,62 +1975,108 @@
           const origSubmit = device.queue.submit.bind(device.queue);
           
           device.queue.submit = function(cmds) {
-            // Collect dispatches and timing helpers from command buffers
-            let dispatchesInSubmit = [];
-            let passTimingHelpers = [];
+            // Collect structured pass entries: each has {helper, dispatches}
+            // This preserves the per-pass dispatch grouping so GPU timing can be
+            // correctly distributed to ALL dispatches in a pass (not just the first).
+            let passEntries = [];
             
             for (const cmd of cmds) {
-              if (cmd.__dispatches) {
-                dispatchesInSubmit.push(...cmd.__dispatches);
-              }
               if (cmd.__passTimings) {
-                passTimingHelpers.push(...cmd.__passTimings);
+                passEntries.push(...cmd.__passTimings);
               }
             }
             
             const result = origSubmit(cmds);
             
             // Get GPU timing results AFTER submission completes
-            if (passTimingHelpers.length > 0) {
+            if (passEntries.length > 0) {
               // Track which command buffers we're timing
               const cmdBuffersWithTiming = cmds.filter(cmd => cmd.__gpuTiming);
               
               device.queue.onSubmittedWorkDone().then(async () => {
                 try {
-                  // Get results from each TimingHelper (each has 1 pass)
+                  // Get results from each TimingHelper (each has 1 pass).
+                  // Each entry's timing is distributed to its associated dispatches.
                   const allDurations = [];
-                  for (const helper of passTimingHelpers) {
-                    if (!helper) {
-                      allDurations.push(0n); // No helper was available
+                  for (const entry of passEntries) {
+                    if (!entry.helper) {
+                      allDurations.push(0);
                       continue;
                     }
                     
                     try {
-                      const durations = await helper.getResult(); // Returns array with 1 duration
-                      allDurations.push(...durations);
+                      const durations = await entry.helper.getResult();
+                      const passDurationNs = Number(durations[0] || 0);
+                      allDurations.push(passDurationNs);
                       
-                      // CRITICAL: Release helper back to pool after getting result
-                      releaseTimingHelper(device, helper);
+                      // Assign GPU timing to dispatches in this pass.
+                      // Single-dispatch passes: assign timing directly (accurate).
+                      // Multi-dispatch passes: store pass aggregate on each dispatch
+                      // but do NOT fabricate per-dispatch times. CPU encoding time
+                      // has zero correlation with GPU execution time, so proportional
+                      // splitting would produce misleading numbers.
+                      const dispatches = entry.dispatches || [];
+                      if (passDurationNs > 0 && dispatches.length > 0) {
+                        if (dispatches.length === 1) {
+                          // === Single dispatch: exact GPU timestamp ===
+                          const dispatch = dispatches[0];
+                          const gpuTimeNs = passDurationNs;
+
+                          dispatch.gpuTimeNs = gpuTimeNs;
+                          dispatch.gpuTimeUs = gpuTimeNs / 1000;
+                          dispatch.gpuTimeMs = gpuTimeNs / 1000000;
+                          dispatch.normalizedTime = normalizeTime(gpuTimeNs);
+                          dispatch.timingSource = 'gpu_timestamp';
+
+                          // Update kernel stats with accurate GPU timing
+                          const kernel = profilerData.kernels[dispatch.kernelId];
+                          if (kernel) {
+                            kernel.stats.totalTime += gpuTimeNs;
+                            kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
+                            kernel.stats.minTime = Math.min(kernel.stats.minTime, gpuTimeNs);
+                            kernel.stats.maxTime = Math.max(kernel.stats.maxTime, gpuTimeNs);
+                          }
+                        } else {
+                          // === Multi-dispatch pass: aggregate only ===
+                          // Store pass-level aggregate on each dispatch for reference,
+                          // but don't pretend we know per-dispatch GPU time.
+                          for (const dispatch of dispatches) {
+                            dispatch.passGpuTimeNs = passDurationNs;
+                            dispatch.passDispatchCount = dispatches.length;
+                            dispatch.timingSource = 'pass_aggregate';
+
+                            // Update kernel stats with even split so listKernels()
+                            // shows non-zero timing for multi-dispatch kernels.
+                            const perDispatchEstimate = passDurationNs / dispatches.length;
+                            const kernel = profilerData.kernels[dispatch.kernelId];
+                            if (kernel) {
+                              kernel.stats.totalTime += perDispatchEstimate;
+                              kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
+                              kernel.stats.minTime = Math.min(kernel.stats.minTime, perDispatchEstimate);
+                              kernel.stats.maxTime = Math.max(kernel.stats.maxTime, perDispatchEstimate);
+                            }
+                          }
+                        }
+                      }
+                      
+                      // Release helper back to pool AFTER getResult() has fully
+                      // completed (mapAsync done, buffer unmapped, state = "free").
+                      releaseTimingHelper(device, entry.helper);
                     } catch (e) {
                       console.warn('[WebSight] Failed to get timing from one pass:', e.message);
-                      allDurations.push(0n); // Push 0 for failed timing
-                      
-                      // Still release the helper even on error
-                      releaseTimingHelper(device, helper);
+                      allDurations.push(0);
+                      releaseTimingHelper(device, entry.helper);
                     }
                   }
                   
-                  // Only log if we have non-zero timings (suppress 0.000ms spam)
-                  const nonZeroCount = allDurations.filter(d => d > 0n).length;
+                  const nonZeroCount = allDurations.filter(d => d > 0).length;
                   if (nonZeroCount > 0) {
-                    console.log(`[WebSight] Got GPU timing for ${nonZeroCount}/${allDurations.length} passes:`, allDurations.map(d => `${(Number(d)/1000000).toFixed(3)}ms`));
+                    console.log(`[WebSight] Got GPU timing for ${nonZeroCount}/${allDurations.length} passes:`, allDurations.map(d => `${(d/1000000).toFixed(3)}ms`));
                   }
                   
                   // Accumulate ALL timings for Method 2 (direct access)
-                  // Add memory leak protection - limit total stored results
                   window.__webSightGlobalTimingResults.push(...allDurations);
                   if (window.__webSightGlobalTimingResults.length > window.__webSightMaxTimingResults) {
-                    // Keep only the most recent results
                     const excess = window.__webSightGlobalTimingResults.length - window.__webSightMaxTimingResults;
                     window.__webSightGlobalTimingResults.splice(0, excess);
                     console.warn(`[WebSight] Timing results buffer full (${window.__webSightMaxTimingResults}). Oldest ${excess} results discarded.`);
@@ -1955,15 +2084,14 @@
                   
                   // Method 3: Populate command buffer timing
                   if (cmdBuffersWithTiming.length > 0) {
-                    const totalTimeNs = allDurations.reduce((sum, t) => sum + Number(t), 0);
+                    const totalTimeNs = allDurations.reduce((sum, t) => sum + t, 0);
                     
                     cmdBuffersWithTiming.forEach(cmd => {
                       cmd.__gpuTiming.available = true;
-                      cmd.__gpuTiming.passes = allDurations.map(d => Number(d));
+                      cmd.__gpuTiming.passes = allDurations;
                       cmd.__gpuTiming.totalTimeNs = totalTimeNs;
                       cmd.__gpuTiming.totalTimeMs = totalTimeNs / 1000000;
                       
-                      // Resolve the ready promise
                       if (cmd.__gpuTimingResolve) {
                         cmd.__gpuTimingResolve(cmd.__gpuTiming);
                       }
@@ -1974,36 +2102,11 @@
                   if (window.__webSightTimingEvents) {
                     window.__webSightTimingEvents.dispatchEvent(new CustomEvent('timing', {
                       detail: {
-                        passes: allDurations.map(d => Number(d)),
-                        totalTimeNs: allDurations.reduce((sum, t) => sum + Number(t), 0),
+                        passes: allDurations,
+                        totalTimeNs: allDurations.reduce((sum, t) => sum + t, 0),
                         commandBuffers: cmdBuffersWithTiming.length
                       }
                     }));
-                  }
-                  
-                  // Update dispatch records for profiler UI
-                  if (dispatchesInSubmit.length > 0) {
-                    for (let i = 0; i < Math.min(allDurations.length, dispatchesInSubmit.length); i++) {
-                      const dispatch = dispatchesInSubmit[i];
-                      const gpuTimeNs = Number(allDurations[i]);
-                      
-                      // Update dispatch with GPU timing
-                      dispatch.gpuTimeNs = gpuTimeNs;
-                      dispatch.gpuTimeUs = gpuTimeNs / 1000;
-                      dispatch.gpuTimeMs = gpuTimeNs / 1000000;
-                      dispatch.normalizedTime = normalizeTime(gpuTimeNs);
-                      dispatch.timingSource = 'gpu_timestamp';
-                      
-                      // Update kernel stats
-                      const kernel = profilerData.kernels[dispatch.kernelId];
-                      if (kernel) {
-                        // Replace CPU time with GPU time in totals
-                        kernel.stats.totalTime = (kernel.stats.totalTime - dispatch.cpuTimeNs) + gpuTimeNs;
-                        kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
-                        kernel.stats.minTime = Math.min(kernel.stats.minTime, gpuTimeNs);
-                        kernel.stats.maxTime = Math.max(kernel.stats.maxTime, gpuTimeNs);
-                      }
-                    }
                   }
                   
                   broadcastData();
@@ -2208,9 +2311,22 @@
       // Statistics
       getStats: () => {
         const dispatches = profilerData.dispatches || [];
-        const validGpuTimes = dispatches
+        // Deduplicate pass_aggregate entries by passId so avgGpuTime
+        // divides by number of passes, not number of dispatches.
+        const singleDispatchTimes = dispatches
           .filter(d => d.timingSource === 'gpu_timestamp')
           .map(d => d.gpuTimeNs);
+        const seenPassIds = new Set();
+        const passAggregateTimes = [];
+        for (const d of dispatches) {
+          if (d.timingSource === 'pass_aggregate' && d.passGpuTimeNs > 0 && d.passId) {
+            if (!seenPassIds.has(d.passId)) {
+              seenPassIds.add(d.passId);
+              passAggregateTimes.push(d.passGpuTimeNs);
+            }
+          }
+        }
+        const validGpuTimes = [...singleDispatchTimes, ...passAggregateTimes];
         
         const unit = getTimeUnitLabel();
         

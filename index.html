@@ -322,10 +322,20 @@
     <script>
         const profilerChannel = new BroadcastChannel('websight-profiler');
 
-        // Respond to ping to indicate UI is alive
+        // Single message handler for all BroadcastChannel messages
         profilerChannel.addEventListener('message', (event) => {
-            if (event.data.type === 'ping') {
-                profilerChannel.postMessage({ type: 'pong' });
+            switch (event.data.type) {
+                case 'ping':
+                    profilerChannel.postMessage({ type: 'pong' });
+                    break;
+                case 'profiler-update':
+                    lastReceivedData = event.data.data;
+                    if (typeof WebSight !== 'undefined') {
+                        const internalData = WebSight.getData();
+                        Object.assign(internalData, event.data.data);
+                        updateUI();
+                    }
+                    break;
             }
         });
 
@@ -382,36 +392,12 @@
         
         function clearProfilingData() {
             if (confirm('Clear all profiling data? This cannot be undone.')) {
-                // Send message to clear data
                 profilerChannel.postMessage({ type: 'clear-data' });
-                
-                // Also clear local UI data if WebSight is available
-                if (typeof WebSight !== 'undefined') {
-                    const data = WebSight.getData();
-                    data.dispatches = [];
-                    data.pipelines = {};
-                    data.buffers = {};
-                    data.kernels = {};
-                    data.logs = [];
-                }
-                
                 updateUI();
             }
         }
 
-        let lastReceivedData = null; // Store last received data for GPU characteristics
-
-        profilerChannel.onmessage = (event) => {
-            if (event.data.type === 'profiler-update') {
-                lastReceivedData = event.data.data; // Store for buffer limit checks
-                if (typeof WebSight !== 'undefined') {
-                    const internalData = WebSight.getData();
-                    // Merge incoming data
-                    Object.assign(internalData, event.data.data);
-                    updateUI(); // Immediately update graphs with new data
-                }
-            }
-        };
+        let lastReceivedData = null;
 
         function updateUI() {
             if (typeof WebSight === 'undefined') return;
@@ -438,8 +424,8 @@
             // Update Summary Statistics
             const allDispatches = data.dispatches;
             
-            // Use gpuTimeUs (microseconds) since that's what the profiler stores
-            const totalGpuTime = allDispatches.reduce((sum, d) => sum + (d.gpuTimeUs || 0), 0);
+            const totalGpuTimeNs = stats.totalGpuTime || 0;
+            const totalGpuTime = totalGpuTimeNs; // already in normalized units from getStats
             const totalCpuTime = allDispatches.reduce((sum, d) => sum + ((d.cpuEnd || 0) - (d.cpuStart || 0)) * 1000, 0);
             
             // Calculate total kernel time from kernel stats
@@ -463,7 +449,7 @@
             // Atomic contention is shown in the graph below
             const atomicContention = 'See Graph';
             
-            document.getElementById('total-gpu-time').textContent = (totalGpuTime / 1000).toFixed(2) + ' ms';
+            document.getElementById('total-gpu-time').textContent = totalGpuTime.toFixed(2) + ' ' + (stats.timeUnit || 'ms');
             document.getElementById('total-cpu-time').textContent = (totalCpuTime / 1000).toFixed(2) + ' ms';
             document.getElementById('total-kernel-time').textContent = (totalKernelTime / 1000000).toFixed(2) + ' ms'; // totalKernelTime is in nanoseconds
             document.getElementById('total-buffer-size').textContent = formatBytes(totalBufferSize);
@@ -581,7 +567,7 @@
             const cpuTimes = cpuData.map(d => d.time / 1000);
             
             // Check if GPU timing is available
-            const hasGpuTiming = gpuData.some(d => d.time > 0 && d.time !== cpuData.find(c => c.inputBytes === d.inputBytes)?.time);
+            const hasGpuTiming = gpuData.some(d => d.time > 0);
             
             // DEBUG: Log graph data
             console.log('=== GRAPH DATA ===');
@@ -791,10 +777,10 @@
 
         // Helper function to format large numbers (1B, 1M, 1K, etc.)
         function formatBytes(bytes) {
-            if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + 'B';
-            if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + 'M';
-            if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + 'K';
-            return bytes.toString();
+            if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+            if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
+            if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + ' KB';
+            return bytes + ' B';
         }
 
         function plotGraph(divId, traces, xLabel, yLabel) {
@@ -813,7 +799,7 @@
                 },
                 yaxis: {
                     title: { text: yLabel, font: { size: 11 } },
-                    type: 'log',
+                    type: graphSettings.scaleType,
                     gridcolor: '#e0e0e0',
                     showline: true,
                     linecolor: '#000',
@@ -852,7 +838,9 @@
                 },
                 line: { 
                     width: 2, 
-                    color: t.line.color
+                    color: t.line.color,
+                    shape: graphSettings.lineShape,
+                    smoothing: graphSettings.smoothing
                 },
                 name: t.name
             }));
@@ -923,7 +911,7 @@
                 { x: labels, y: uniform, name: 'Uniform', type: 'bar', marker: { color: '#9933ff' } }
             ];
             
-            Plotly.newPlot('buffer-size-graph', traces, {
+            Plotly.react('buffer-size-graph', traces, {
                 barmode: 'stack',
                 showlegend: true,
                 legend: {
@@ -1000,7 +988,7 @@
                 return;
             }
             
-            Plotly.newPlot('atomic-graph', [{
+            Plotly.react('atomic-graph', [{
                 x, y, type: 'scatter', mode: 'lines+markers',
                 line: { color: '#ff6600', width: 2 }, marker: { size: 4, color: '#ff6600' }
             }], {
@@ -1125,7 +1113,7 @@
             const container = document.getElementById('kernel-grid-container');
             
             kernels.forEach((kernel, idx) => {
-                const dispatches = data.dispatches.filter(d => d.kernelId === kernel.id && d.gpuTime > 0);
+                const dispatches = data.dispatches.filter(d => d.kernelId === kernel.id && d.gpuTimeNs > 0);
                 if (dispatches.length === 0) return;
                 
                 const boxDiv = document.createElement('div');
@@ -1146,10 +1134,10 @@
                 container.appendChild(boxDiv);
                 
                 const x = dispatches.map((d, i) => i);
-                const y = dispatches.map(d => d.gpuTime);
+                const y = dispatches.map(d => d.gpuTimeNs / 1000);
                 
                 setTimeout(() => {
-                    Plotly.newPlot(`kernel-graph-${idx}`, [{
+                    Plotly.react(`kernel-graph-${idx}`, [{
                         x, y, 
                         type: 'scatter', 
                         mode: 'lines+markers',

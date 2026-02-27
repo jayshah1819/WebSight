@@ -176,19 +176,20 @@
         this.#state === "wait for result",
         `must call resolveTiming (state === ${this.#state})`
       );
-      this.#state = "free";
+      this.#state = "reading";
 
       this.#passNumber = 0;
 
       const resultBuffer = this.#resultBuffer;
       await resultBuffer.mapAsync(GPUMapMode.READ);
-      const times = new BigInt64Array(resultBuffer.getMappedRange());
+      const times = new BigUint64Array(resultBuffer.getMappedRange());
       const durations = [];
       for (let idx = 0; idx < times.length; idx += 2) {
         durations.push(Number(times[idx + 1] - times[idx]));
       }
       resultBuffer.unmap();
       this.#resultBuffers.push(resultBuffer);
+      this.#state = "free";
       return durations;
     }
 
@@ -638,7 +639,11 @@
         analysis.potentialSpeedup = 'Already optimal';
       }
       
-      this.analyses.set(dispatch.kernelId, analysis);
+      // Keep worst-scoring analysis per kernel
+      const existing = this.analyses.get(dispatch.kernelId);
+      if (!existing || analysis.score < existing.score) {
+        this.analyses.set(dispatch.kernelId, analysis);
+      }
       return analysis;
     }
     
@@ -866,25 +871,52 @@
       const branches = [];
       const lines = code.split('\n');
       
-      // Look for if statements inside loops
-      let inLoop = false;
       let loopDepth = 0;
+      let braceStack = [];
       
       lines.forEach((line, idx) => {
-        if (/\bfor\b|\bwhile\b|\bloop\b/.test(line)) {
-          inLoop = true;
-          loopDepth++;
+        const trimmed = line.trim();
+        // Skip full-line comments
+        if (trimmed.startsWith('//')) return;
+        
+        // Strip inline comments before analysis
+        const noComment = trimmed.replace(/\/\/.*$/, '');
+        
+        const isLoopLine = /\b(for|while|loop)\b/.test(noComment);
+        
+        // Count opening braces on this line
+        const opens = (noComment.match(/{/g) || []).length;
+        // Count closing braces on this line
+        const closes = (noComment.match(/}/g) || []).length;
+        
+        // Process opens: first open on a loop line is tagged 'loop',
+        // all others are 'block'.
+        let loopOpensUsed = 0;
+        for (let i = 0; i < opens; i++) {
+          if (isLoopLine && loopOpensUsed === 0) {
+            braceStack.push('loop');
+            loopDepth++;
+            loopOpensUsed++;
+          } else {
+            braceStack.push('block');
+          }
         }
-        if (inLoop && /\bif\b/.test(line) && !line.includes('//')) {
+        
+        if (loopDepth > 0 && /\bif\b/.test(noComment)) {
           branches.push({
             line: idx + 1,
-            code: line.trim(),
+            code: trimmed,
             inLoopDepth: loopDepth
           });
         }
-        if (line.includes('}') && loopDepth > 0) {
-          loopDepth--;
-          if (loopDepth === 0) inLoop = false;
+        
+        for (let i = 0; i < closes; i++) {
+          if (braceStack.length > 0) {
+            const popped = braceStack.pop();
+            if (popped === 'loop') {
+              loopDepth--;
+            }
+          }
         }
       });
       
@@ -921,8 +953,9 @@
       const lines = code.split('\n');
       
       lines.forEach((line, idx) => {
-        // Look for array[expression * stride] patterns
-        if (/\[\s*\w+\s*\*\s*\d+\s*\]/.test(line)) {
+        // Only flag strides > 4 (small strides are fine for vec4/matrix access)
+        const strideMatch = line.match(/\[\s*\w+\s*\*\s*(\d+)\s*\]/);
+        if (strideMatch && parseInt(strideMatch[1]) > 4) {
           patterns.push({
             line: idx + 1,
             code: line.trim(),
@@ -930,7 +963,6 @@
           });
         }
         
-        // Look for indirect indexing
         if (/\[\s*\w+\[\w+\]\s*\]/.test(line)) {
           patterns.push({
             line: idx + 1,
@@ -963,20 +995,42 @@
     
     analyzeLoops(code) {
       const lines = code.split('\n');
-      let depth = 0;
+      let loopDepth = 0;
       let maxDepth = 0;
       let total = 0;
       let nested = 0;
+      let braceStack = [];
       
       lines.forEach(line => {
-        if (/\bfor\b|\bwhile\b|\bloop\b/.test(line)) {
-          total++;
-          depth++;
-          if (depth > 1) nested++;
-          maxDepth = Math.max(maxDepth, depth);
+        const trimmed = line.trim();
+        if (trimmed.startsWith('//')) return;
+        const noComment = trimmed.replace(/\/\/.*$/, '');
+        
+        const isLoopLine = /\b(for|while|loop)\b/.test(noComment);
+        const opens = (noComment.match(/{/g) || []).length;
+        const closes = (noComment.match(/}/g) || []).length;
+        
+        let loopOpensUsed = 0;
+        for (let i = 0; i < opens; i++) {
+          if (isLoopLine && loopOpensUsed === 0) {
+            braceStack.push('loop');
+            loopDepth++;
+            total++;
+            if (loopDepth > 1) nested++;
+            maxDepth = Math.max(maxDepth, loopDepth);
+            loopOpensUsed++;
+          } else {
+            braceStack.push('block');
+          }
         }
-        if (line.includes('}')) {
-          depth = Math.max(0, depth - 1);
+        
+        for (let i = 0; i < closes; i++) {
+          if (braceStack.length > 0) {
+            const popped = braceStack.pop();
+            if (popped === 'loop') {
+              loopDepth--;
+            }
+          }
         }
       });
       
@@ -1122,7 +1176,7 @@
             gpuCharacteristics: profilerData.gpuCharacteristics,
             runs: profilerData.runs,
             runId: profilerData.runId,
-            timingMode: profilerData.timingMode,  // Add timing mode
+            timingMode: profilerData.timingMode,
             sessionStart: profilerData.sessionStart,
             timestamp: Date.now()
           }
@@ -1221,7 +1275,6 @@
       message, 
       time: Date.now() 
     });
-    // Only log to console if verbose logging is enabled
     if (profilerData.config.verboseLogging) {
       console.log(`[WebSight] ${message}`);
     }
@@ -1239,51 +1292,51 @@
 
     if (!shaderCode) return analysis;
 
-    // Pattern 1: Sequential access (GOOD - 100% efficiency)
-    // Matches: data[global_id.x], data[workgroup_id.x * size]
-    if (/data\s*\[\s*global_id\s*\.\s*x\s*\]/.test(shaderCode) ||
-        /\[\s*workgroup_id\s*\.\s*x\s*\*/.test(shaderCode)) {
+    // Sequential/linear access
+    if (/\w+\s*\[\s*(?:global_invocation_id|global_id|local_invocation_id|local_id)\s*\.\s*x\s*\]/.test(shaderCode) ||
+        /\[\s*(?:global_invocation_id|workgroup_id)\s*\.\s*x\s*\*/.test(shaderCode)) {
         analysis.accessPatternType = 'sequential';
         analysis.coalesced = true;
         analysis.cacheEfficiency = 'high';
         analysis.estimatedAccessRatio = 1.0;
     }
 
-    // Pattern 2: Strided access (BAD - reduced efficiency)
-    // Matches: data[i * stride] where stride > 1
-    if (/\[\s*\w+\s*\*\s*\d+\s*\]/.test(shaderCode) && !/\*\s*1\s*\]/.test(shaderCode)) {
-        const strideMatch = shaderCode.match(/\*\s*(\d+)/);
-        const stride = strideMatch ? parseInt(strideMatch[1]) : 4;
+    // Strided access: only flag strides > 4. Scans all shader paths.
+    const strideMatches = shaderCode.match(/\[\s*\w+\s*\*\s*(\d+)\s*\]/g) || [];
+    let worstStride = 0;
+    for (const m of strideMatches) {
+        const n = parseInt(m.match(/\*\s*(\d+)/)[1]);
+        if (n > 4 && n > worstStride) worstStride = n;
+    }
+    if (worstStride > 4 && analysis.accessPatternType !== 'sequential') {
         analysis.accessPatternType = 'strided';
         analysis.coalesced = false;
         analysis.cacheEfficiency = 'low';
-        analysis.warnings.push(`Strided access (stride ~${stride}) - poor coalescing`);
-        // Strided access only touches fraction of buffer
-        analysis.estimatedAccessRatio = 1.0 / Math.max(1, stride * 0.25);
+        analysis.warnings.push(`Strided access (stride ~${worstStride}) - poor coalescing`);
+        analysis.estimatedAccessRatio = 1.0 / Math.max(1, worstStride * 0.25);
     }
 
-    // Pattern 3: Random/indirect access (VERY BAD)
-    // Matches: data[indices[i]]
-    if (/\[\s*\w+\s*\[\s*\w+\s*\]\s*\]/.test(shaderCode)) {
+    // Random/indirect access
+    if (/\w+\s*\[\s*\w+\s*\[\s*[^\]]+\]\s*\]/.test(shaderCode)) {
         analysis.accessPatternType = 'random';
         analysis.coalesced = false;
         analysis.cacheEfficiency = 'very-low';
         analysis.warnings.push('Random/indirect access - severe bandwidth penalty');
-        analysis.estimatedAccessRatio = 0.3;  // Conservative estimate
+        analysis.estimatedAccessRatio = 0.3;
     }
 
-    // Pattern 4: Shared memory usage (GOOD - reduces global memory traffic)
+    // Shared memory usage
     if (/var\s*<\s*workgroup\s*>/.test(shaderCode)) {
-        analysis.warnings.push(' Using shared memory - reduced traffic');
+        analysis.warnings.push('Using shared memory - reduced global traffic');
         const workgroupThreads = workgroupSize.reduce((a, b) => a * b, 1);
         if (workgroupThreads >= 64) {
-            analysis.estimatedAccessRatio *= 0.5;  // 50% reduction
+            analysis.estimatedAccessRatio *= 0.5;
         }
     }
 
-    // Pattern 5: Compute-heavy detection
+    // Compute-heavy detection
     const mathOps = (shaderCode.match(/\b(sin|cos|tan|exp|log|pow|sqrt)\s*\(/g) || []).length;
-    const memoryOps = (shaderCode.match(/\[\s*\w+\s*\]/g) || []).length;
+    const memoryOps = (shaderCode.match(/\w+\s*\[/g) || []).length;
     
     if (mathOps > memoryOps * 3) {
         analysis.warnings.push('Compute-heavy kernel - bandwidth not bottleneck');
@@ -1355,26 +1408,21 @@
         if (attachment && attachment.view) {
             let attachmentBytes = calculateTextureSize(attachment.view);
             
-            // Fallback: if texture metadata not available (e.g., canvas texture), 
-            // try to infer from view or use conservative estimate
+            // Fallback: infer dimensions from view
             if (attachmentBytes === 0) {
-                // Try multiple ways to get texture dimensions
                 const view = attachment.view;
                 let width, height;
                 
-                // Method 1: Check if view has texture property (non-standard but common)
                 if (view.texture) {
                     width = view.texture.width;
                     height = view.texture.height;
                 }
                 
-                // Method 2: Check descriptor (if view was created with explicit dimensions)
                 if (!width && view.descriptor) {
                     width = view.descriptor.size?.width;
                     height = view.descriptor.size?.height;
                 }
                 
-                // Method 3: Check internal properties (Chrome/WebKit specific)
                 if (!width && view.__texture) {
                     width = view.__texture.width;
                     height = view.__texture.height;
@@ -1384,7 +1432,6 @@
                     const bytesPerPixel = 4; // RGBA8 typical for canvas
                     attachmentBytes = width * height * bytesPerPixel;
                 } else {
-                    // Last resort: assume 800x600 (common default canvas size)
                     width = 800;
                     height = 600;
                     const bytesPerPixel = 4;
@@ -1417,17 +1464,16 @@
 
   class BandwidthTracker {
     constructor() {
-      this.passResources = new Map(); // Tracks resources actively bound in current pass
+      this.passResources = new Map();
       this.totalBytesRead = 0;
       this.totalBytesWritten = 0;
+      this.totalBytesReadWrite = 0;
     }
 
-    // Call this when intercepting setBindGroup
     trackBindGroup(bindGroup, bindGroupLayout) {
         if (!bindGroup || !bindGroup.__websight_resources) return;
         
         bindGroup.__websight_resources.forEach(res => {
-            // Track which resources are ACTUALLY bound in this pass
             if (!this.passResources.has(res.id)) {
                 this.passResources.set(res.id, {
                     size: res.size,
@@ -1436,38 +1482,41 @@
                     accessType: res.accessType
                 });
                 
-                // Accumulate based on access pattern
+                // read-write buffers split at calculateBandwidth time
                 if (res.accessType === 'read-only') {
                     this.totalBytesRead += res.size;
                 } else if (res.accessType === 'write-only') {
                     this.totalBytesWritten += res.size;
                 } else if (res.accessType === 'read-write') {
-                    this.totalBytesRead += res.size;
-                    this.totalBytesWritten += res.size;
+                    this.totalBytesReadWrite += res.size;
                 }
             }
         });
     }
 
-    calculateBandwidth(durationNs) {
-        const totalBytes = this.totalBytesRead + this.totalBytesWritten;
+    calculateBandwidth(durationNs, accessPatternType) {
+        // Split r/w bytes by access pattern: sequential=70/30, else 50/50
+        let rwReadFraction = 0.5;
+        if (accessPatternType === 'sequential') {
+            rwReadFraction = 0.7;
+        }
+        const rwRead = this.totalBytesReadWrite * rwReadFraction;
+        const rwWrite = this.totalBytesReadWrite * (1 - rwReadFraction);
+
+        const bytesRead = this.totalBytesRead + rwRead;
+        const bytesWritten = this.totalBytesWritten + rwWrite;
+        const totalBytes = bytesRead + bytesWritten;
         const durationSec = durationNs / 1e9;
         const gb = totalBytes / (1024 ** 3);
         
         return {
-            bytesRead: this.totalBytesRead,
-            bytesWritten: this.totalBytesWritten,
+            bytesRead: bytesRead,
+            bytesWritten: bytesWritten,
             totalBytes: totalBytes,
             totalDataMB: (totalBytes / (1024 ** 2)).toFixed(2),
             bandwidthGBs: durationSec > 0 ? (gb / durationSec).toFixed(2) : 0,
             resourceCount: this.passResources.size
         };
-    }
-
-    reset() {
-        this.passResources.clear();
-        this.totalBytesRead = 0;
-        this.totalBytesWritten = 0;
     }
   }
 
@@ -1492,15 +1541,17 @@
       if (contextType === 'webgpu' && context) {
         // Hook getCurrentTexture to track canvas textures
         const origGetCurrentTexture = context.getCurrentTexture.bind(context);
+        // Stable ID per context so leak detector doesn't see a new resource each frame
+        let canvasTextureId = crypto.randomUUID();
+        
         context.getCurrentTexture = function() {
           const texture = origGetCurrentTexture();
           
-          // Add metadata to the texture (since it wasn't created via device.createTexture)
           if (texture && !texture.__websight_id) {
             const canvas = this.canvas;
-            texture.__websight_id = crypto.randomUUID();
+            texture.__websight_id = canvasTextureId;
             texture.__websight_metadata = {
-              id: texture.__websight_id,
+              id: canvasTextureId,
               label: 'canvas_texture',
               width: canvas.width,
               height: canvas.height,
@@ -1517,8 +1568,6 @@
               view.__websight_texture = texture.__websight_metadata;
               return view;
             };
-            
-            console.log('[WebSight] Tracked canvas texture:', texture.__websight_metadata);
           }
           
           return texture;
@@ -1603,7 +1652,6 @@
             }
           });
           
-          // Store device reference on the device object itself for easy lookup
           device.__webSightInfo = deviceInfo;
           
           addLog(`Device ${window.__webSightDevices.length} created - Timing: ${profilerData.timingMode}, Label: ${deviceInfo.label}`);
@@ -1616,9 +1664,6 @@
             
             module.__source = desc.code;
             module.__shaderId = shaderId;
-            
-            // Store shader code for on-demand analysis
-            // Don't analyze automatically 
             
             return module;
           };
@@ -1705,10 +1750,12 @@
             };
             profilerData.buffers[bufferId] = buffer.__capture;
             
-            // Track for memory leak detection
-            memoryLeakDetector.trackResource(buffer, 'GPUBuffer', desc.size);
+            // Skip profiler-internal TimingHelper buffers
+            const isProfilerInternal = (desc.label || '').startsWith('TimingHelper');
+            if (!isProfilerInternal) {
+              memoryLeakDetector.trackResource(buffer, 'GPUBuffer', desc.size);
+            }
             
-            // Hook destroy method
             const origDestroy = buffer.destroy.bind(buffer);
             buffer.destroy = function() {
               memoryLeakDetector.markDestroyed(buffer);
@@ -1801,9 +1848,8 @@
                   const textureView = e.resource;
                   const textureSize = calculateTextureSize(textureView);
                   
-                  // Textures in fragment shader = read-only (samplers)
-                  // Textures in compute = could be read-write (storage textures)
-                  accessType = 'read-only'; // Conservative default
+                  // Textures in fragment shader default to read-only
+                  accessType = 'read-only';
                   
                   resource = {
                     id: textureView.__websight_texture?.id || crypto.randomUUID(),
@@ -1826,17 +1872,14 @@
             return bg;
           };
 
-          // Global timing accumulator for exposing to BasePrimitive.__timingHelper interface
-          // This accumulates ALL pass timings across all encoders in current execution
+          // Global timing accumulator
           if (!window.__webSightGlobalTimingResults) {
             window.__webSightGlobalTimingResults = [];
             window.__webSightMaxTimingResults = 10000; 
           }
           
 
-          // WebGPU limit: Varies by GPU (typically 30-60 QuerySets on integrated GPUs)
-          // Each TimingHelper uses 1 QuerySet with 2 timestamps (begin/end)
-          // Strategy: Create helpers up to GPU limit, then WAIT for completion before reuse
+          // TimingHelper pool — reuse to avoid QuerySet exhaustion
           if (!window.__webSightTimingHelperPools) {
             window.__webSightTimingHelperPools = new Map(); // Per-device pools
           }
@@ -1849,49 +1892,42 @@
                 available: [], // Queue of helpers ready to use
                 inUse: new Set(), // Helpers currently in use
                 index: 0,
-                maxSize: 1, // Ultra-conservative: only 1 TimingHelper to avoid GPU QuerySet limits
-                passesPerHelper: 1, // 1 pass per helper = most reliable for rapid single-pass operations
-                failed: false, // Track if timing completely unavailable
-                limitReached: false // Track if we've hit the GPU QuerySet limit
+                maxSize: 8,
+                passesPerHelper: 1,
+                failed: false,
+                limitReached: false
               });
             }
             
             const pool = window.__webSightTimingHelperPools.get(device);
             
-            // If timing previously failed completely, don't keep trying
             if (pool.failed) {
               return null;
             }
             
-            // If we have available helpers in queue, use those first
             if (pool.available.length > 0) {
               const helper = pool.available.shift();
               pool.inUse.add(helper);
               return helper;
             }
             
-            // If we haven't hit the limit yet, try to create new helper WITH GPU-level validation
             if (pool.helpers.length < pool.maxSize && !pool.limitReached) {
               try {
-                // Push error scope BEFORE creating TimingHelper to catch GPU-level failures
                 device.pushErrorScope('validation');
                 const helper = new TimingHelper(device, pool.passesPerHelper);
                 
-                // Check for GPU-level errors synchronously-ish
+                // Check for GPU-level errors
                 device.popErrorScope().then(error => {
                   if (error) {
-                    // GPU rejected the QuerySet - mark pool as failed
                     console.error('[WebSight]  GPU QuerySet creation failed:', error.message);
                     pool.limitReached = true;
                     pool.failed = true;
-                    // Remove the failed helper from pool
                     const idx = pool.helpers.indexOf(helper);
                     if (idx >= 0) pool.helpers.splice(idx, 1);
                     pool.inUse.delete(helper);
                   }
                 });
                 
-                // Only add to pool if creation succeeded (no exception thrown)
                 pool.helpers.push(helper);
                 pool.inUse.add(helper);
                 if (pool.helpers.length <= 5 || pool.helpers.length % 10 === 0) {
@@ -1933,10 +1969,9 @@
               pool.index++;
             }
             
-            return null; // No available helpers - caller handles graceful degradation
+            return null;
           };
           
-          // Helper function to release a TimingHelper back to the pool after use
           const releaseTimingHelper = (device, helper) => {
             const pool = window.__webSightTimingHelperPools.get(device);
             if (!pool || !helper) return;
@@ -1967,24 +2002,19 @@
             };
             profilerData.activeEncoders.set(encoder, encoderData);
 
-            // Create NEW TimingHelper for THIS encoder (like primitive.mjs does)
-            // We don't know how many passes in advance, so start with 1 and adjust per pass
             let encoderTimingHelper = null;
-            let passTimings = []; // Collect pass timings manually
+            let passTimings = [];
             
             // Skip GPU timing in minimal overhead mode
             if (profilerData.timingMode === 'gpu' && !profilerData.config.minimalOverhead) {
               try {
-                // Don't use TimingHelper - it requires exact kernel count up front
-                // Instead, track passes manually
                 console.log(`[WebSight] GPU timing enabled for encoder "${desc?.label || 'unlabeled'}"`);
               } catch (e) {
                 console.error(`[WebSight] GPU timing setup failed: ${e.message}`);
               }
             }
 
-            // Create a proxy encoder with ORIGINAL beginComputePass for TimingHelper
-            // Also include resolveQuerySet and copyBufferToBuffer which are used by #resolveTiming
+            // Proxy encoder to avoid recursion in TimingHelper
             const proxyEncoder = {
               beginComputePass: origBeginComputePass,
               beginRenderPass: origBeginRenderPass,
@@ -1993,43 +2023,40 @@
             };
 
             encoder.beginComputePass = function(passDesc) {
-              // Get or reuse a TimingHelper from pool (instead of creating unlimited new ones)
               let passTimingHelper = null;
               if (profilerData.timingMode === 'gpu') {
                 passTimingHelper = getTimingHelper(device);
-                if (passTimingHelper) {
-                  passTimings.push(passTimingHelper);
-                }
-                // No error logging here - getTimingHelper already handles that
               }
               
-              // Use TimingHelper's beginComputePass on PROXY encoder (prevents recursion)
-              // If no timing helper available, just use original pass (graceful degradation)
               let pass;
               if (passTimingHelper) {
                 try {
                   pass = passTimingHelper.beginComputePass(proxyEncoder, passDesc);
                 } catch (e) {
-                  // If beginComputePass fails (e.g., invalid QuerySet), fall back to regular pass
                   console.warn('[WebSight] TimingHelper.beginComputePass failed, continuing without timing:', e.message);
                   pass = origBeginComputePass(passDesc);
-                  passTimingHelper = null; // Don't track this failed helper
-                  passTimings.pop(); // Remove from passTimings array
+                  passTimingHelper = null;
                 }
               } else {
                 pass = origBeginComputePass(passDesc);
               }
               
               encoderData.passCount++;
-              device.__webSightInfo.passCount++; // Track per-device
+              device.__webSightInfo.passCount++;
               
               pass.__dispatches = [];
+              pass.__passId = crypto.randomUUID();
+
+              if (passTimingHelper) {
+                passTimings.push({ helper: passTimingHelper, dispatches: pass.__dispatches });
+              }
+
               pass.__boundPipeline = null;
               pass.__boundBindGroups = {};
-              pass.__timingHelper = passTimingHelper; // Store on pass for later
+              pass.__timingHelper = passTimingHelper;
               pass.__passType = 'compute';
               pass.__deviceLabel = device.__webSightInfo.label;
-              pass.__bandwidthTracker = new BandwidthTracker(); // Track bandwidth per pass
+              pass.__bandwidthTracker = new BandwidthTracker();
 
               const origSetPipeline = pass.setPipeline.bind(pass);
               pass.setPipeline = function(p) {
@@ -2040,7 +2067,6 @@
               const origSetBindGroup = pass.setBindGroup.bind(pass);
               pass.setBindGroup = function(i, bg) {
                 this.__boundBindGroups[i] = bg;
-                // Track resources for bandwidth calculation
                 this.__bandwidthTracker.trackBindGroup(bg);
                 origSetBindGroup(i, bg);
               };
@@ -2056,7 +2082,7 @@
                   return;
                 }
                 
-                // Get label from pipeline object or capture
+                // Get label
                 const pipelineLabel = pipelineObj?.label || pipeline?.label || 'compute_pipeline';
 
                 const kernelId = generateKernelId(
@@ -2075,7 +2101,7 @@
                   };
                 }
 
-                // CRITICAL: Check dispatch dimensions BEFORE executing
+                // Check dispatch dimensions
                 const maxDim = device.limits?.maxComputeWorkgroupsPerDimension || 65535;
                 const dispatchX = x || 1;
                 const dispatchY = y || 1;
@@ -2098,7 +2124,7 @@
                   violationMsg += `Z dimension (${dispatchZ}) exceeds limit ${maxDim}. `;
                 }
                 
-                // Report dimension violations without trying to auto-correct
+                // Skip invalid dispatch to avoid device-lost error
                 if (dimensionViolation) {
                   const errorMsg = `DISPATCH GEOMETRY ERROR: ${violationMsg}`;
                   
@@ -2107,11 +2133,11 @@
                     level: 'error',
                     category: 'dispatch-geometry',
                     message: errorMsg,
-                    details: `Pipeline: "${pipelineLabel}"\nDispatch: [${dispatchX}, ${dispatchY}, ${dispatchZ}]\nWorkgroup: [${pipeline.workgroupSize?.join(', ') || '?'}]\nMax Allowed Per Dimension: ${maxDim}\n\nWARNING: This dispatch will be REJECTED by the GPU driver!\nRoot Cause: Likely nested if-inside-while in getSimpleDispatchGeometry(). Y dimension must be reduced in a separate while loop AFTER X is fully reduced.`
+                    details: `Pipeline: "${pipelineLabel}"\nDispatch: [${dispatchX}, ${dispatchY}, ${dispatchZ}]\nWorkgroup: [${pipeline.workgroupSize?.join(', ') || '?'}]\nMax Allowed Per Dimension: ${maxDim}\n\nDISPATCH BLOCKED by profiler to prevent GPU device loss.\nRoot Cause: Likely nested if-inside-while in getSimpleDispatchGeometry(). Y dimension must be reduced in a separate while loop AFTER X is fully reduced.`
                   });
                   
-                  // Trigger immediate broadcast for critical errors
                   broadcastData();
+                  return;
                 }
 
                 const cpuStart = performance.now();
@@ -2120,7 +2146,7 @@
                 const cpuTimeMs = cpuEnd - cpuStart;
                 const cpuTimeNs = cpuTimeMs * 1000000;
 
-                // Convert workgroupSize to array format (handles both object and array)
+                // Convert workgroupSize to array
                 let workgroupSizeArray = [1, 1, 1];
                 if (pipeline.workgroupSize) {
                   if (Array.isArray(pipeline.workgroupSize)) {
@@ -2146,23 +2172,21 @@
                   cpuTimeNs: cpuTimeNs,
                   cpuTimeUs: cpuTimeNs / 1000,
                   cpuTimeMs: cpuTimeMs,
-                  gpuTimeNs: cpuTimeNs, // Default to CPU time
-                  gpuTimeUs: cpuTimeNs / 1000,
-                  gpuTimeMs: cpuTimeMs,
-                  timingSource: 'cpu_timing',
+                  gpuTimeNs: 0,
+                  gpuTimeUs: 0,
+                  gpuTimeMs: 0,
+                  timingSource: 'pending',
                   normalizedTime: normalizeTime(cpuTimeNs),
                   timeUnit: getTimeUnitLabel(),
                   timestampStart: -1,
                   timestampEnd: -1,
-                  deviceLabel: device.__webSightInfo.label, // Multi-GPU tracking
+                  deviceLabel: device.__webSightInfo.label,
                   passType: 'compute',
-                  dimensionViolation: dimensionViolation // Mark failed dispatches
+                  passId: pass.__passId,
+                  dimensionViolation: dimensionViolation
                 };
 
-                // Calculate bandwidth using BandwidthTracker (already tracked via setBindGroup)
-                const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(cpuTimeNs);
-                
-                // Get buffer details for display (lighter weight - just for UI)
+                // Bandwidth byte counts (GB/s deferred until GPU timing arrives)
                 const bufferAccesses = Object.values(this.__boundBindGroups).flatMap(bg =>
                     bg.__websight_resources || []
                 ).map(res => ({
@@ -2172,17 +2196,32 @@
                     accessType: res.accessType
                 }));
 
-                // Add to dispatch record
+                // Analyze memory access pattern to estimate effective bandwidth
+                const memoryPattern = analyzeMemoryAccessPattern(
+                    pipeline.shader,
+                    bufferAccesses,
+                    workgroupSizeArray,
+                    [x || 1, y || 1, z || 1]
+                );
+                dispatchRecord.memoryPattern = memoryPattern;
+
+                const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(0, memoryPattern.accessPatternType);
+
                 dispatchRecord.bufferAccesses = bufferAccesses;
                 
-                // Bandwidth metrics from BandwidthTracker
+                const accessRatio = memoryPattern.estimatedAccessRatio;
+                
+                // Bandwidth metrics scaled by access ratio
                 dispatchRecord.bandwidth = {
-                    bytesRead: bandwidthStats.bytesRead,
-                    bytesWritten: bandwidthStats.bytesWritten,
-                    totalBytes: bandwidthStats.totalBytes,
+                    bytesRead: Math.round(bandwidthStats.bytesRead * accessRatio),
+                    bytesWritten: Math.round(bandwidthStats.bytesWritten * accessRatio),
+                    totalBytes: Math.round(bandwidthStats.totalBytes * accessRatio),
                     bandwidthGBs: parseFloat(bandwidthStats.bandwidthGBs) || 0,
                     arithmeticIntensity: 0,  // FLOPs per byte (optional manual annotation)
-                    resourceCount: bandwidthStats.resourceCount
+                    resourceCount: bandwidthStats.resourceCount,
+                    rawTotalBytes: bandwidthStats.totalBytes,  // Unscaled for reference
+                    accessRatio: accessRatio,
+                    accessPattern: memoryPattern.accessPatternType
                 };
                 
                 if (profilerData.config.enableWorkgroupAnalysis) {
@@ -2212,7 +2251,6 @@
                         details: details
                       });
                       
-                      // Also trigger immediate broadcast for critical issues
                       broadcastData();
                     } else if (analysis.score < 70) {
                       const warningMsg = `Suboptimal workgroup config for "${pipeline.label}" (Score: ${analysis.score})`;
@@ -2232,16 +2270,13 @@
                 const kernel = profilerData.kernels[kernelId];
                 if (kernel) {
                   kernel.stats.count++;
-                  kernel.stats.totalTime += dispatchRecord.gpuTimeNs;
-                  kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
-                  kernel.stats.minTime = Math.min(kernel.stats.minTime, dispatchRecord.gpuTimeNs);
-                  kernel.stats.maxTime = Math.max(kernel.stats.maxTime, dispatchRecord.gpuTimeNs);
+                  // Time stats updated in onSubmittedWorkDone
                 }
 
                 profilerData.dispatches.push(dispatchRecord);
                 pass.__dispatches.push(dispatchRecord);
                 encoderData.dispatches.push(dispatchRecord);
-                device.__webSightInfo.dispatchCount++; // Track per-device
+                device.__webSightInfo.dispatchCount++;
 
                 dispatchRecord.bufferAccesses.forEach(b => {
                   if (b?.id) {
@@ -2255,48 +2290,43 @@
               return pass;
             };
 
-            // Hook beginRenderPass for graphical applications (same timing strategy as compute)
             encoder.beginRenderPass = function(passDesc) {
               try {
-                // Get or reuse a TimingHelper from pool
                 let passTimingHelper = null;
                 if (profilerData.timingMode === 'gpu') {
                   passTimingHelper = getTimingHelper(device);
-                  if (passTimingHelper) {
-                    passTimings.push(passTimingHelper);
-                  }
-                  // No error logging here - getTimingHelper already handles that
                 }
 
-                // Use TimingHelper's beginRenderPass on PROXY encoder (prevents recursion)
-                // If no timing helper available, just use original pass (graceful degradation)
                 let pass;
                 if (passTimingHelper) {
                   try {
                     pass = passTimingHelper.beginRenderPass(proxyEncoder, passDesc);
                   } catch (e) {
-                    // If beginRenderPass fails (e.g., invalid QuerySet), fall back to regular pass
                     console.warn('[WebSight] TimingHelper.beginRenderPass failed, continuing without timing:', e.message);
                     pass = origBeginRenderPass(passDesc);
-                    passTimingHelper = null; // Don't track this failed helper
-                    passTimings.pop(); // Remove from passTimings array
+                    passTimingHelper = null;
                   }
                 } else {
                   pass = origBeginRenderPass(passDesc);
                 }
                 
                 encoderData.passCount++;
-                device.__webSightInfo.passCount++; // Track per-device
+                device.__webSightInfo.passCount++;
 
                 pass.__dispatches = [];
+                pass.__passId = crypto.randomUUID();
+
+                if (passTimingHelper) {
+                  passTimings.push({ helper: passTimingHelper, dispatches: pass.__dispatches });
+                }
+
                 pass.__boundBindGroups = {};
                 pass.__passType = 'render';
-                pass.__timingHelper = passTimingHelper; // Store for later timing retrieval
+                pass.__timingHelper = passTimingHelper;
                 pass.__deviceLabel = device.__webSightInfo.label;
-                pass.__passDescriptor = passDesc; // Store pass descriptor for bandwidth calculation
-                pass.__bandwidthTracker = new BandwidthTracker(); // Track bandwidth per pass
+                pass.__passDescriptor = passDesc;
+                pass.__bandwidthTracker = new BandwidthTracker();
 
-                // Track render pass operations (draw calls instead of dispatches)
                 const origSetPipeline = pass.setPipeline.bind(pass);
                 pass.setPipeline = function(p) {
                   this.__boundPipeline = p;
@@ -2306,12 +2336,10 @@
                 const origSetBindGroup = pass.setBindGroup.bind(pass);
                 pass.setBindGroup = function(i, bg) {
                   this.__boundBindGroups[i] = bg;
-                  // Track resources for bandwidth calculation
                   this.__bandwidthTracker.trackBindGroup(bg);
                   origSetBindGroup(i, bg);
                 };
 
-                // Track draw calls as "dispatches" for consistency
                 const origDraw = pass.draw.bind(pass);
                 pass.draw = function(vertexCount, instanceCount, firstVertex, firstInstance) {
                   const cpuStart = performance.now();
@@ -2332,6 +2360,7 @@
                     timingSource: 'render_pass_timing',
                     deviceLabel: device.__webSightInfo.label,
                     passType: 'render',
+                    passId: pass.__passId,
                     bufferAccesses: []
                   };
 
@@ -2340,10 +2369,9 @@
                   drawRecord.cpuEnd = performance.now();
                   const cpuTimeMs = drawRecord.cpuEnd - drawRecord.cpuStart;
                   drawRecord.cpuTimeNs = cpuTimeMs * 1000000;
-                  drawRecord.gpuTimeNs = drawRecord.cpuTimeNs; // Default to CPU time
+                  drawRecord.gpuTimeNs = 0;
 
-                  // Get bandwidth from tracker + framebuffer
-                  const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(cpuTimeMs * 1000000);
+                  const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(0, undefined);
                   let totalBytesRead = bandwidthStats.bytesRead;
                   let totalBytesWritten = bandwidthStats.bytesWritten;
                   
@@ -2355,23 +2383,18 @@
 
                   const totalBytes = totalBytesRead + totalBytesWritten;
                   
-                  // Add bandwidth metrics
-                  const bandwidthGBs = (totalBytes > 0 && cpuTimeMs > 0) 
-                      ? totalBytes / (cpuTimeMs / 1000) / (1024 ** 3) 
-                      : 0;
-                      
                   drawRecord.bandwidth = {
                       bytesRead: totalBytesRead,
                       bytesWritten: totalBytesWritten,
                       totalBytes: totalBytes,
-                      bandwidthGBs: bandwidthGBs,
+                      bandwidthGBs: 0,
                       arithmeticIntensity: 0
                   };
 
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
                   encoderData.dispatches.push(drawRecord);
-                  device.__webSightInfo.dispatchCount++; // Track per-device
+                  device.__webSightInfo.dispatchCount++;
 
                   broadcastData();
                 };
@@ -2397,6 +2420,7 @@
                     timingSource: 'render_pass_timing',
                     deviceLabel: device.__webSightInfo.label,
                     passType: 'render',
+                    passId: pass.__passId,
                     bufferAccesses: []
                   };
 
@@ -2405,14 +2429,12 @@
                   drawRecord.cpuEnd = performance.now();
                   const cpuTimeMs = drawRecord.cpuEnd - drawRecord.cpuStart;
                   drawRecord.cpuTimeNs = cpuTimeMs * 1000000;
-                  drawRecord.gpuTimeNs = drawRecord.cpuTimeNs;
+                  drawRecord.gpuTimeNs = 0;
 
-                  // Get bandwidth from tracker + framebuffer
-                  const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(cpuTimeMs * 1000000);
+                  const bandwidthStats = this.__bandwidthTracker.calculateBandwidth(0, undefined);
                   let totalBytesRead = bandwidthStats.bytesRead;
                   let totalBytesWritten = bandwidthStats.bytesWritten;
                   
-                  // ALWAYS add framebuffer bandwidth for render passes
                   const passDesc = this.__passDescriptor;
                   const fbBandwidth = calculateFramebufferBandwidth(passDesc, indexCount, instanceCount);
                   totalBytesRead += fbBandwidth.bytesRead;
@@ -2420,23 +2442,18 @@
                   
                   const totalBytes = totalBytesRead + totalBytesWritten;
                   
-                  // Add bandwidth metrics
-                  const bandwidthGBs = (totalBytes > 0 && cpuTimeMs > 0) 
-                      ? totalBytes / (cpuTimeMs / 1000) / (1024 ** 3) 
-                      : 0;
-                      
                   drawRecord.bandwidth = {
                       bytesRead: totalBytesRead,
                       bytesWritten: totalBytesWritten,
                       totalBytes: totalBytes,
-                      bandwidthGBs: bandwidthGBs,
+                      bandwidthGBs: 0,
                       arithmeticIntensity: 0
                   };
 
                   profilerData.dispatches.push(drawRecord);
                   pass.__dispatches.push(drawRecord);
                   encoderData.dispatches.push(drawRecord);
-                  device.__webSightInfo.dispatchCount++; // Track per-device
+                  device.__webSightInfo.dispatchCount++;
 
                   broadcastData();
                 };
@@ -2452,10 +2469,10 @@
               const commandBuffer = origFinish.call(this, descriptor);
               commandBuffer.__dispatches = encoderData.dispatches;
               commandBuffer.__encoderId = encoderData.id;
-              commandBuffer.__passTimings = passTimings; // Store array of TimingHelpers (one per pass)
+              commandBuffer.__passTimings = passTimings;
               commandBuffer.__passCount = encoderData.passCount;
               
-              // Method 3: Expose timing API on command buffer for universal access
+              // Expose timing API on command buffer
               commandBuffer.__gpuTiming = {
                 available: false,
                 passes: [],
@@ -2477,149 +2494,148 @@
           const origSubmit = device.queue.submit.bind(device.queue);
           
           device.queue.submit = function(cmds) {
-            // Collect dispatches and timing helpers from command buffers
-            let dispatchesInSubmit = [];
-            let passTimingHelpers = [];
+            let passEntries = [];
             
             for (const cmd of cmds) {
-              if (cmd.__dispatches) {
-                dispatchesInSubmit.push(...cmd.__dispatches);
-              }
               if (cmd.__passTimings) {
-                passTimingHelpers.push(...cmd.__passTimings);
+                passEntries.push(...cmd.__passTimings);
               }
             }
             
             const result = origSubmit(cmds);
             
-            // Get GPU timing results AFTER submission completes
-            if (passTimingHelpers.length > 0) {
-              // Track which command buffers we're timing
+            if (passEntries.length > 0) {
               const cmdBuffersWithTiming = cmds.filter(cmd => cmd.__gpuTiming);
               
               device.queue.onSubmittedWorkDone().then(async () => {
                 try {
-                  // Get results from each TimingHelper (each has 1 pass)
                   const allDurations = [];
-                  for (const helper of passTimingHelpers) {
-                    if (!helper) {
-                      allDurations.push(0n); // No helper was available
+                  for (const entry of passEntries) {
+                    if (!entry.helper) {
+                      allDurations.push(0);
                       continue;
                     }
                     
                     try {
-                      const durations = await helper.getResult();
-                      allDurations.push(...durations);
+                      const durations = await entry.helper.getResult();
+                      const passDurationNs = Number(durations[0] || 0);
+                      allDurations.push(passDurationNs);
                       
-                      releaseTimingHelper(device, helper);
+                      // Single-dispatch: assign GPU time directly.
+                      // Multi-dispatch: store pass aggregate; don't fabricate per-dispatch times.
+                      const dispatches = entry.dispatches || [];
+                      if (passDurationNs > 0 && dispatches.length > 0) {
+                        if (dispatches.length === 1) {
+                          const dispatch = dispatches[0];
+                          const gpuTimeNs = passDurationNs;
+
+                          dispatch.gpuTimeNs = gpuTimeNs;
+                          dispatch.gpuTimeUs = gpuTimeNs / 1000;
+                          dispatch.gpuTimeMs = gpuTimeNs / 1000000;
+                          dispatch.normalizedTime = normalizeTime(gpuTimeNs);
+                          dispatch.timingSource = 'gpu_timestamp';
+
+                          // Recalculate bandwidth with GPU timing
+                          if (dispatch.bandwidth && gpuTimeNs > 0) {
+                            const gpuTimeSec = gpuTimeNs / 1e9;
+                            dispatch.bandwidth.bandwidthGBs = dispatch.bandwidth.totalBytes / gpuTimeSec / (1024 ** 3);
+                            if (device.limits.maxStorageBufferBindingSize) {
+                              const estimatedPeakBandwidth = 500; // GB/s (conservative)
+                              dispatch.bandwidth.memoryEfficiency = (dispatch.bandwidth.bandwidthGBs / estimatedPeakBandwidth) * 100;
+                            }
+                          }
+
+                          // Update kernel stats
+                          const kernel = profilerData.kernels[dispatch.kernelId];
+                          if (kernel) {
+                            kernel.stats.totalTime += gpuTimeNs;
+                            kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
+                            kernel.stats.minTime = Math.min(kernel.stats.minTime, gpuTimeNs);
+                            kernel.stats.maxTime = Math.max(kernel.stats.maxTime, gpuTimeNs);
+
+                            if (!kernel.bandwidth) {
+                              kernel.bandwidth = {
+                                totalBytesRead: 0, totalBytesWritten: 0, totalBytes: 0,
+                                avgBandwidthGBs: 0, peakBandwidthGBs: 0
+                              };
+                            }
+                            if (dispatch.bandwidth) {
+                              kernel.bandwidth.totalBytesRead += dispatch.bandwidth.bytesRead;
+                              kernel.bandwidth.totalBytesWritten += dispatch.bandwidth.bytesWritten;
+                              kernel.bandwidth.totalBytes += dispatch.bandwidth.totalBytes;
+                              kernel.bandwidth.avgBandwidthGBs = kernel.bandwidth.totalBytes / (kernel.stats.totalTime / 1e9) / (1024 ** 3);
+                              kernel.bandwidth.peakBandwidthGBs = Math.max(
+                                kernel.bandwidth.peakBandwidthGBs || 0,
+                                dispatch.bandwidth.bandwidthGBs
+                              );
+                            }
+                          }
+                        } else {
+                          for (const dispatch of dispatches) {
+                            dispatch.passGpuTimeNs = passDurationNs;
+                            dispatch.passDispatchCount = dispatches.length;
+                            dispatch.timingSource = 'pass_aggregate';
+
+                            // Evenly divide for kernel stats (approximate)
+                            const perDispatchEstimate = passDurationNs / dispatches.length;
+                            const kernel = profilerData.kernels[dispatch.kernelId];
+                            if (kernel) {
+                              kernel.stats.totalTime += perDispatchEstimate;
+                              kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
+                              kernel.stats.minTime = Math.min(kernel.stats.minTime, perDispatchEstimate);
+                              kernel.stats.maxTime = Math.max(kernel.stats.maxTime, perDispatchEstimate);
+                            }
+                          }
+                        }
+                      }
+                      
+                      // Release helper back to pool after getResult() completes
+                      releaseTimingHelper(device, entry.helper);
                     } catch (e) {
                       console.warn('[WebSight] Failed to get timing from one pass:', e.message);
-                      allDurations.push(0n);
-                      
-                      releaseTimingHelper(device, helper);
+                      allDurations.push(0);
+                      releaseTimingHelper(device, entry.helper);
                     }
                   }
                   
-                  const nonZeroCount = allDurations.filter(d => d > 0n).length;
+                  const nonZeroCount = allDurations.filter(d => d > 0).length;
                   if (nonZeroCount > 0) {
-                    console.log(`[WebSight] Got GPU timing for ${nonZeroCount}/${allDurations.length} passes:`, allDurations.map(d => `${(Number(d)/1000000).toFixed(3)}ms`));
+                    console.log(`[WebSight] Got GPU timing for ${nonZeroCount}/${allDurations.length} passes:`, allDurations.map(d => `${(d/1000000).toFixed(3)}ms`));
                   }
                   
-                  // Accumulate ALL timings for Method 2 (direct access)
-                  // Add memory leak protection - limit total stored results
+                  // Accumulate timings for direct access
                   window.__webSightGlobalTimingResults.push(...allDurations);
                   if (window.__webSightGlobalTimingResults.length > window.__webSightMaxTimingResults) {
-                    // Keep only the most recent results
                     const excess = window.__webSightGlobalTimingResults.length - window.__webSightMaxTimingResults;
                     window.__webSightGlobalTimingResults.splice(0, excess);
                     console.warn(`[WebSight] Timing results buffer full (${window.__webSightMaxTimingResults}). Oldest ${excess} results discarded.`);
                   }
                   
-                  // Method 3: Populate command buffer timing
+                  // Populate command buffer timing
                   if (cmdBuffersWithTiming.length > 0) {
-                    const totalTimeNs = allDurations.reduce((sum, t) => sum + Number(t), 0);
+                    const totalTimeNs = allDurations.reduce((sum, t) => sum + t, 0);
                     
                     cmdBuffersWithTiming.forEach(cmd => {
                       cmd.__gpuTiming.available = true;
-                      cmd.__gpuTiming.passes = allDurations.map(d => Number(d));
+                      cmd.__gpuTiming.passes = allDurations;
                       cmd.__gpuTiming.totalTimeNs = totalTimeNs;
                       cmd.__gpuTiming.totalTimeMs = totalTimeNs / 1000000;
                       
-                      // Resolve the ready promise
                       if (cmd.__gpuTimingResolve) {
                         cmd.__gpuTimingResolve(cmd.__gpuTiming);
                       }
                     });
                   }
                   
-                  // Method 4: Fire timing event
+                  // Fire timing event
                   if (window.__webSightTimingEvents) {
                     window.__webSightTimingEvents.dispatchEvent(new CustomEvent('timing', {
                       detail: {
-                        passes: allDurations.map(d => Number(d)),
-                        totalTimeNs: allDurations.reduce((sum, t) => sum + Number(t), 0),
+                        passes: allDurations,
+                        totalTimeNs: allDurations.reduce((sum, t) => sum + t, 0),
                         commandBuffers: cmdBuffersWithTiming.length
                       }
                     }));
-                  }
-                  
-                  // Update dispatch records for profiler UI
-                  if (dispatchesInSubmit.length > 0) {
-                    for (let i = 0; i < Math.min(allDurations.length, dispatchesInSubmit.length); i++) {
-                      const dispatch = dispatchesInSubmit[i];
-                      const gpuTimeNs = Number(allDurations[i]);
-
-                      // Update dispatch with GPU timing
-                      dispatch.gpuTimeNs = gpuTimeNs;
-                      dispatch.gpuTimeUs = gpuTimeNs / 1000;
-                      dispatch.gpuTimeMs = gpuTimeNs / 1000000;
-                      dispatch.normalizedTime = normalizeTime(gpuTimeNs);
-                      dispatch.timingSource = 'gpu_timestamp';
-
-                      // Recalculate bandwidth with ACCURATE GPU timing
-                      if (dispatch.bandwidth && gpuTimeNs > 0) {
-                          const gpuTimeSec = gpuTimeNs / 1e9;  // Convert to seconds
-                          dispatch.bandwidth.bandwidthGBs = dispatch.bandwidth.totalBytes / gpuTimeSec / (1024 ** 3);
-                          
-                          // Calculate memory efficiency (% of theoretical peak)
-                          if (device.limits.maxStorageBufferBindingSize) {
-                              const estimatedPeakBandwidth = 500;  // GB/s (conservative)
-                              dispatch.bandwidth.memoryEfficiency = (dispatch.bandwidth.bandwidthGBs / estimatedPeakBandwidth) * 100;
-                          }
-                      }
-
-                      // Update kernel stats with bandwidth
-                      const kernel = profilerData.kernels[dispatch.kernelId];
-                      if (kernel) {
-                        // Replace CPU time with GPU time in totals
-                        kernel.stats.totalTime = (kernel.stats.totalTime - dispatch.cpuTimeNs) + gpuTimeNs;
-                        kernel.stats.avgTime = kernel.stats.totalTime / kernel.stats.count;
-                        kernel.stats.minTime = Math.min(kernel.stats.minTime, gpuTimeNs);
-                        kernel.stats.maxTime = Math.max(kernel.stats.maxTime, gpuTimeNs);
-                        
-                        // NEW: Aggregate bandwidth stats per kernel
-                        if (!kernel.bandwidth) {
-                            kernel.bandwidth = {
-                                totalBytesRead: 0,
-                                totalBytesWritten: 0,
-                                totalBytes: 0,
-                                avgBandwidthGBs: 0,
-                                peakBandwidthGBs: 0
-                            };
-                        }
-                        
-                        if (dispatch.bandwidth) {
-                            kernel.bandwidth.totalBytesRead += dispatch.bandwidth.bytesRead;
-                            kernel.bandwidth.totalBytesWritten += dispatch.bandwidth.bytesWritten;
-                            kernel.bandwidth.totalBytes += dispatch.bandwidth.totalBytes;
-                            kernel.bandwidth.avgBandwidthGBs = kernel.bandwidth.totalBytes / (kernel.stats.totalTime / 1e9) / (1024 ** 3);
-                            kernel.bandwidth.peakBandwidthGBs = Math.max(
-                                kernel.bandwidth.peakBandwidthGBs || 0,
-                                dispatch.bandwidth.bandwidthGBs
-                            );
-                        }
-                      }
-                    }
                   }
                   
                   broadcastData();
@@ -2655,7 +2671,7 @@
               }
             };
             
-            // Method 4: Event-based timing notifications (for real-time apps)
+            // Event-based timing notifications
             window.__webSightTimingEvents = new EventTarget();
             
             log('[WebSight] GPU Timing enabled - Multiple access methods:');
@@ -2745,7 +2761,7 @@
         profilerData.dispatches = []; 
         profilerData.logs = [];
         profilerData.kernels = {};
-        // Note: Each encoder has its own TimingHelper now
+        // Note: Each encoder has its own TimingHelper
         addLog('Profiler cleared');
       },
       
@@ -2781,7 +2797,7 @@
           }
         }
         
-        // Note: maxPasses and allowDynamicGrowth are now per-encoder, not global
+        // Note: maxPasses and allowDynamicGrowth are per-encoder
         
         return {
           broadcastEnabled: profilerData.config.broadcastEnabled,
@@ -2808,9 +2824,21 @@
       
       getStats: () => {
         const dispatches = profilerData.dispatches || [];
-        const validGpuTimes = dispatches
+        // Deduplicate pass_aggregate by passId to avoid inflating the denominator
+        const singleDispatchTimes = dispatches
           .filter(d => d.timingSource === 'gpu_timestamp')
           .map(d => d.gpuTimeNs);
+        const seenPassIds = new Set();
+        const passAggregateTimes = [];
+        for (const d of dispatches) {
+          if (d.timingSource === 'pass_aggregate' && d.passGpuTimeNs > 0 && d.passId) {
+            if (!seenPassIds.has(d.passId)) {
+              seenPassIds.add(d.passId);
+              passAggregateTimes.push(d.passGpuTimeNs);
+            }
+          }
+        }
+        const validGpuTimes = [...singleDispatchTimes, ...passAggregateTimes];
         
         const unit = getTimeUnitLabel();
 
@@ -2864,9 +2892,31 @@
         console.log('\n[WebSight] Bandwidth Analysis Report');
         console.log('═'.repeat(80));
 
-        const dispatches = profilerData.dispatches.filter(d => 
-            d.bandwidth && d.timingSource === 'gpu_timestamp'
-        );
+        // Deduplicate pass_aggregate by passId to avoid double-counting
+        const seenBandwidthPassIds = new Set();
+        const dispatches = profilerData.dispatches.filter(d => {
+            if (!d.bandwidth) return false;
+            if (d.timingSource === 'gpu_timestamp') return true;
+            if (d.timingSource === 'pass_aggregate') {
+              if (d.passId && seenBandwidthPassIds.has(d.passId)) return false;
+              if (d.passId) seenBandwidthPassIds.add(d.passId);
+              return true;
+            }
+            return false;
+        }).map(d => {
+          if (d.timingSource === 'pass_aggregate') {
+            const gpuTimeSec = d.passGpuTimeNs / 1e9;
+            return {
+              ...d,
+              gpuTimeNs: d.passGpuTimeNs,
+              bandwidth: {
+                ...d.bandwidth,
+                bandwidthGBs: gpuTimeSec > 0 ? d.bandwidth.totalBytes / gpuTimeSec / (1024 ** 3) : 0
+              }
+            };
+          }
+          return d;
+        });
         
         if (dispatches.length === 0) {
             console.log('\nWARNING: No GPU-timed dispatches with bandwidth data available.');
@@ -2901,8 +2951,8 @@
             kb.totalTimeNs += d.gpuTimeNs;
             kb.peakBandwidthGBs = Math.max(kb.peakBandwidthGBs, d.bandwidth.bandwidthGBs);
             
-            if (d.memoryPattern && !kb.memoryPatterns.includes(d.memoryPattern.type)) {
-                kb.memoryPatterns.push(d.memoryPattern.type);
+            if (d.memoryPattern && !kb.memoryPatterns.includes(d.memoryPattern.accessPatternType)) {
+                kb.memoryPatterns.push(d.memoryPattern.accessPatternType);
             }
         });
 
@@ -3071,7 +3121,6 @@
         // Analyze all dispatches on-demand
         console.log('\n [WebSight] Analyzing workgroup configurations...');
         
-        // Analyze all recorded dispatches
         profilerData.dispatches.forEach(dispatch => {
           if (dispatch.workgroupSize && dispatch.dispatchSize) {
             workgroupAnalyzer.analyzeDispatch(dispatch);
@@ -3121,7 +3170,6 @@
         // Analyze all shaders on-demand
         console.log('\n [WebSight] Analyzing shader complexity...');
         
-        // Analyze all kernels' shaders
         Object.values(profilerData.kernels).forEach(kernel => {
           if (kernel.shaderId && kernel.shader && !shaderAnalyzer.analyses.has(kernel.shaderId)) {
             shaderAnalyzer.analyzeShader(kernel.shaderId, kernel.shader);
