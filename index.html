@@ -8,7 +8,10 @@
         window.__webSightDisableAutoUI = true;
         window.__webSightIsUIWindow = true;
     </script>
-    <script src="profiler-standalone.js?v=6"></script>
+    <!-- Module entry point: loads directly from src/ — edit any src/ file and just refresh -->
+    <script type="module" src="src/public-api.js"></script>
+    <!-- PRODUCTION: swap to the bundle below (run `node build.mjs` first) -->
+    <!-- <script src="profiler-standalone.js?v=6"></script> -->
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -162,6 +165,14 @@
                 <div>
                     <div style="font-size: 12px; color: #666; margin-bottom: 3px;">Total Dispatches</div>
                     <div id="total-dispatches" style="font-size: 20px; font-weight: bold; color: #9900cc;">0</div>
+                </div>
+                <div>
+                    <div style="font-size: 12px; color: #666; margin-bottom: 3px;">Effective Bandwidth</div>
+                    <div id="effective-bandwidth" style="font-size: 20px; font-weight: bold; color: #007755;">— GB/s</div>
+                </div>
+                <div>
+                    <div style="font-size: 12px; color: #666; margin-bottom: 3px;">Peak Bandwidth</div>
+                    <div id="bw-efficiency" style="font-size: 20px; font-weight: bold; color: #007755;">—</div>
                 </div>
             </div>
         </div>
@@ -330,11 +341,11 @@
                     break;
                 case 'profiler-update':
                     lastReceivedData = event.data.data;
-                    if (typeof WebSight !== 'undefined') {
-                        const internalData = WebSight.getData();
-                        Object.assign(internalData, event.data.data);
-                        updateUI();
-                    }
+                    // Use broadcast data for display only — do NOT merge it into the live
+                    // profilerData store. WebSight.getData() returns a reference to the live
+                    // object; Object.assign would overwrite live dispatches/kernels with stale
+                    // serialized copies, corrupting subsequent getStats() calls.
+                    updateUI();
                     break;
             }
         });
@@ -366,10 +377,7 @@
             updateUI();
         });
 
-        // Don't use setInterval - only update when broadcast messages arrive
-        // This prevents constant UI flickering during benchmarks
-        // setInterval(updateUI, 3000);
-        
+
         // Profiler control functions
         let profilingEnabled = true;
         
@@ -393,6 +401,8 @@
         function clearProfilingData() {
             if (confirm('Clear all profiling data? This cannot be undone.')) {
                 profilerChannel.postMessage({ type: 'clear-data' });
+                peakObservedBW = 0;
+                updatePeakBWDisplay();
                 updateUI();
             }
         }
@@ -403,6 +413,13 @@
             if (typeof WebSight === 'undefined') return;
             
             const data = WebSight.getData();
+
+            // Cross-page dashboard mode: the benchmark runs in a separate tab with its own
+            
+            if (data.dispatches.length === 0 && lastReceivedData?.dispatches?.length > 0) {
+                Object.assign(data, lastReceivedData);
+            }
+
             const stats = WebSight.getStats();
             
             // Get timing mode from data (broadcast) or fallback
@@ -418,264 +435,102 @@
             if (data.dispatches.length === 0) return;
             
             // Filter for dispatches with timing data (either GPU or CPU)
-            // Check gpuTimeNs (the actual property name) instead of gpuTime
-            const dispatches = data.dispatches.filter(d => d.gpuTimeNs > 0 || d.cpuStart);
+            // Check gpuTimeMs (the actual property name) instead of gpuTime
+            const dispatches = data.dispatches.filter(d => d.gpuTimeMs > 0 || d.cpuStart);
             
             // Update Summary Statistics
             const allDispatches = data.dispatches;
             
-            const totalGpuTimeNs = stats.totalGpuTime || 0;
-            const totalGpuTime = totalGpuTimeNs; // already in normalized units from getStats
-            const totalCpuTime = allDispatches.reduce((sum, d) => sum + ((d.cpuEnd || 0) - (d.cpuStart || 0)) * 1000, 0);
-            
-            // Calculate total kernel time from kernel stats
-            let totalKernelTime = 0;
-            if (data.kernels && typeof data.kernels === 'object') {
-                totalKernelTime = Object.values(data.kernels).reduce((sum, k) => {
-                    return sum + (k.stats?.totalTime || 0);
-                }, 0);
-            }
-            
-            // Calculate total buffer size (data.buffers might be array or object)
-            let totalBufferSize = 0;
-            if (data.buffers) {
-                if (Array.isArray(data.buffers)) {
-                    totalBufferSize = data.buffers.reduce((sum, b) => sum + (b.size || 0), 0);
-                } else if (typeof data.buffers === 'object') {
-                    totalBufferSize = Object.values(data.buffers).reduce((sum, b) => sum + (b.size || 0), 0);
-                }
-            }
-            
-            // Atomic contention is shown in the graph below
-            const atomicContention = 'See Graph';
-            
-            document.getElementById('total-gpu-time').textContent = totalGpuTime.toFixed(2) + ' ' + (stats.timeUnit || 'ms');
-            document.getElementById('total-cpu-time').textContent = (totalCpuTime / 1000).toFixed(2) + ' ms';
-            document.getElementById('total-kernel-time').textContent = (totalKernelTime / 1000000).toFixed(2) + ' ms'; // totalKernelTime is in nanoseconds
-            document.getElementById('total-buffer-size').textContent = formatBytes(totalBufferSize);
-            document.getElementById('atomic-contention').textContent = atomicContention;
+            // All summary stats come from the profiler — no calculations here
+            document.getElementById('total-gpu-time').textContent = (stats.totalGpuTime || 0).toFixed(2) + ' ' + (stats.timeUnit || 'ms');
+            document.getElementById('total-cpu-time').textContent = (stats.totalCpuTimeMs || 0).toFixed(2) + ' ms (cmd recording)';
+            document.getElementById('total-kernel-time').textContent = (stats.totalKernelTimeMs || 0).toFixed(2) + ' ms';
+            document.getElementById('total-buffer-size').textContent = formatBytes(stats.totalBufferSizeBytes || 0);
+            document.getElementById('atomic-contention').textContent = 'See Graph';
             document.getElementById('total-dispatches').textContent = allDispatches.length;
             
             if (dispatches.length === 0) return;
             
-            // DEBUG: Check bandwidth data
-            console.log('=== BANDWIDTH DEBUG ===');
-            console.log('Total dispatches:', dispatches.length);
-            console.log('Dispatches with bandwidth:', dispatches.filter(d => d.bandwidth).length);
-            dispatches.forEach((d, i) => {
-                if (d.bandwidth) {
-                    console.log(`Dispatch ${i}:`, {
-                        label: d.pipelineLabel,
-                        bandwidthGBs: d.bandwidth.bandwidthGBs,
-                        totalBytes: d.bandwidth.totalBytes,
-                        timingSource: d.timingSource
-                    });
-                } else {
-                    console.log(`Dispatch ${i}: NO BANDWIDTH DATA`);
-                }
-            });
+            // Effective bandwidth comes from getStats() — no recalculation here
+            const aggBWGBs = stats.bandwidth?.avgBandwidthGBs || 0;
+            document.getElementById('effective-bandwidth').textContent =
+                aggBWGBs > 0 ? aggBWGBs.toFixed(1) + ' GB/s' : '— GB/s';
+            // Peak BW: use the profiler's own peakBandwidthGBs (max single-dispatch bandwidth
+            // from current data) rather than a running dashboard max. This auto-resets when
+            // WebSight.clear() is called, so it always reflects live data not a stale session high.
+            const peakBWGBs = stats.bandwidth?.peakBandwidthGBs || 0;
+            if (peakBWGBs !== peakObservedBW) {
+                peakObservedBW = peakBWGBs;
+                updatePeakBWDisplay();
+            }
             
-            // Group dispatches by largest data buffer size for bandwidth analysis
-            const sizeGroups = new Map();
-            
-            dispatches.forEach(d => {
-                const buffers = d.bufferAccesses || [];
-                
-                // Filter to data buffers (large buffers or named data/in/out/key/payload)
-                const dataBuffers = buffers.filter(b => {
-                    const label = (b.label || '').toLowerCase();
-                    const size = b.size || 0;
-                    return size > 1024 * 1024 || 
-                           label.includes('in') || 
-                           label.includes('out') || 
-                           label.includes('key') ||
-                           label.includes('payload') ||
-                           label.includes('data') ||
-                           label.includes('buffer');
+            // All grouping, aggregation, and GB/s math is done by the profiler.
+            // kernels is one entry per pipeline label — each kernel gets its own trace so
+            // Plotly draws a separate line per kernel instead of one jagged line that zigzags
+            // between kernels that share the same x (input size) values.
+            const { kernels, gpu, cpu, hasGpuTiming } = WebSight.getGraphData();
+
+            // Color palette for kernel traces — cycles if more than 8 kernels
+            const KERNEL_COLORS = ['#00aa00','#0066cc','#cc0000','#ff8800','#9933ff','#00aacc','#aa6600','#cc0066'];
+
+            // Build one bandwidth trace and one time trace per kernel
+            const bandwidthTraces = [];
+            const timeTraces      = [];
+
+            if (kernels && kernels.length > 0) {
+                kernels.forEach((k, i) => {
+                    const color   = KERNEL_COLORS[i % KERNEL_COLORS.length];
+                    const src     = (hasGpuTiming && k.gpu.inputSizes.length > 0) ? k.gpu : k.cpu;
+                    const suffix  = (hasGpuTiming && k.gpu.inputSizes.length > 0) ? '' : ' (CPU)';
+                    if (src.inputSizes.length === 0) return;
+                    bandwidthTraces.push({ x: src.inputSizes, y: src.bandwidth, name: k.label + suffix, line: { color, width: 2 }, mode: 'lines+markers' });
+                    timeTraces.push({      x: src.inputSizes, y: src.times,     name: k.label + suffix, line: { color, width: 2 }, mode: 'lines+markers' });
                 });
-                
-                // Use largest data buffer as proxy for working set size
-                // For render passes with no buffers, use framebuffer size from bandwidth.totalBytes
-                const largestBuffer = dataBuffers.length > 0 
-                    ? Math.max(...dataBuffers.map(b => b.size || 0))
-                    : (buffers.length > 0 ? Math.max(...buffers.map(b => b.size || 0)) : 
-                       (d.bandwidth?.totalBytes || 0)); // Use framebuffer bandwidth as size
-                
-                if (!sizeGroups.has(largestBuffer)) {
-                    sizeGroups.set(largestBuffer, []);
+            } else {
+                // Fallback: aggregate arrays (single kernel or no label)
+                const bwSrc   = hasGpuTiming ? gpu : cpu;
+                const timeSrc = hasGpuTiming ? gpu : cpu;
+                const label   = hasGpuTiming ? 'GPU' : 'CPU (JS overhead)';
+                const color   = hasGpuTiming ? '#00aa00' : '#666666';
+                if (bwSrc.inputSizes.length > 0) {
+                    bandwidthTraces.push({ x: bwSrc.inputSizes,  y: bwSrc.bandwidth,  name: label, line: { color, width: 2 }, mode: 'lines+markers' });
+                    timeTraces.push({      x: timeSrc.inputSizes, y: timeSrc.times,     name: label, line: { color, width: 2 }, mode: 'lines+markers' });
                 }
-                sizeGroups.get(largestBuffer).push(d);
-            });
-            
-            // Create data points from profiler's bandwidth data (no recalculation!)
-            const dataPoints = [];
-            sizeGroups.forEach((dispatches, largestBuffer) => {
-                const inputBytes = largestBuffer;
-                const inputSizeMB = inputBytes / (1024 * 1024);
-                
-                // Separate GPU and CPU timed dispatches
-                const gpuDispatches = dispatches.filter(d => d.timingSource === 'gpu_timestamp' && d.bandwidth);
-                const cpuDispatches = dispatches.filter(d => d.timingSource === 'cpu_timing' && d.bandwidth);
-                
-                // Use profiler's pre-calculated bandwidth (average across dispatches in this group)
-                const gpuBandwidth = gpuDispatches.length > 0
-                    ? gpuDispatches.reduce((sum, d) => sum + d.bandwidth.bandwidthGBs, 0) / gpuDispatches.length
-                    : 0;
-                
-                const cpuBandwidth = cpuDispatches.length > 0
-                    ? cpuDispatches.reduce((sum, d) => sum + d.bandwidth.bandwidthGBs, 0) / cpuDispatches.length
-                    : 0;
-                
-                // Get total time (for time graph)
-                const totalGpuTimeNs = gpuDispatches.reduce((sum, d) => sum + (d.gpuTimeNs || 0), 0);
-                const totalCpuTimeNs = cpuDispatches.reduce((sum, d) => sum + (d.cpuTimeNs || 0), 0);
-                
-                // Only add GPU data point if we have GPU timing
-                if (gpuDispatches.length > 0) {
-                    dataPoints.push({
-                        inputSizeMB,
-                        inputBytes,
-                        time: totalGpuTimeNs,
-                        bandwidth: gpuBandwidth,  // Direct from profiler!
-                        timing: 'GPU'
-                    });
-                }
-                
-                // Only add CPU data point if we have CPU timing (fallback)
-                if (cpuDispatches.length > 0) {
-                    dataPoints.push({
-                        inputSizeMB,
-                        inputBytes,
-                        time: totalCpuTimeNs,
-                        bandwidth: cpuBandwidth,  // Direct from profiler!
-                        timing: 'CPU'
-                    });
-                }
-            });
-            
-            // Sort by input size for proper line connections
-            dataPoints.sort((a, b) => a.inputBytes - b.inputBytes);
-            
-            // Separate GPU and CPU data for plotting
-            const gpuData = dataPoints.filter(d => d.timing === 'GPU');
-            const cpuData = dataPoints.filter(d => d.timing === 'CPU');
-            
-            const inputSizes = [...new Set(dataPoints.map(d => d.inputSizeMB))].sort((a, b) => a - b);
-            const gpuBandwidth = gpuData.map(d => d.bandwidth);
-            const cpuBandwidth = cpuData.map(d => d.bandwidth);
-            const gpuTimes = gpuData.map(d => d.time / 1000);
-            const cpuTimes = cpuData.map(d => d.time / 1000);
-            
-            // Check if GPU timing is available
-            const hasGpuTiming = gpuData.some(d => d.time > 0);
-            
-            // DEBUG: Log graph data
-            console.log('=== GRAPH DATA ===');
-            console.log('Data points:', dataPoints.length);
-            console.log('GPU data points:', gpuData.length);
-            console.log('Input sizes:', inputSizes);
-            console.log('GPU bandwidth values:', gpuBandwidth);
-            console.log('Has GPU timing:', hasGpuTiming);
-            
-            // Plot Bandwidth vs Input Size
-            const bandwidthTraces = [
-                {
-                    x: inputSizes,
-                    y: gpuBandwidth,
-                    name: 'GPU',
-                    line: { color: '#00aa00', width: 2 },
-                    mode: 'lines+markers'
-                }
-            ];
-            
-            // Show CPU bandwidth only if GPU timing unavailable
-            if (!hasGpuTiming) {
-                bandwidthTraces.push({
-                    x: inputSizes,
-                    y: cpuBandwidth,
-                    name: 'CPU (JS overhead)',
-                    line: { color: '#666666', width: 1, dash: 'dot' },
-                    mode: 'lines+markers'
-                });
             }
             
             plotGraph('bandwidth-graph', bandwidthTraces, 'Input Size (MB)', 'Bandwidth (GB/s)');
             
-            // Plot Time vs Input Size
-            const timeTraces = [
-                {
-                    x: inputSizes,
-                    y: gpuTimes,
-                    name: 'GPU',
-                    line: { color: '#00aa00', width: 2 },
-                    mode: 'lines+markers'
-                }
-            ];
-            
-            if (!hasGpuTiming) {
-                timeTraces.push({
-                    x: inputSizes,
-                    y: cpuTimes,
-                    name: 'CPU (JS overhead)',
-                    line: { color: '#666666', width: 1, dash: 'dot' },
-                    mode: 'lines+markers'
-                });
-            }
-            
             plotGraph('time-graph', timeTraces, 'Input Size (MB)', 'Time (μs)');
             
             // Buffer Size Graph
-            plotBufferSizes(data.buffers);
+            plotBufferSizes();
             
             // Atomic Contention Graph
-            plotAtomicContention(dispatches);
+            plotAtomicContention();
             
-            updateDispatchList(data.dispatches);
+            updateDispatchList();
             
-            updateKernelList(data.kernels);
+            updateKernelList();
             
-            updateKernelGraphs(data);
+            updateKernelGraphs();
             
-            // Update workgroup summary automatically
-            updateWorkgroupSummary(data.dispatches);
+        // Update workgroup summary automatically
+            updateWorkgroupSummary();
+        }
+
+        let peakObservedBW = 0;
+
+        function updatePeakBWDisplay() {
+            const effEl = document.getElementById('bw-efficiency');
+            if (!effEl) return;
+            effEl.textContent = peakObservedBW > 0 ? peakObservedBW.toFixed(1) + ' GB/s' : '—';
         }
         
-        function updateWorkgroupSummary(dispatches) {
-            if (!dispatches || dispatches.length === 0) {
-                return;
-            }
-            
+        function updateWorkgroupSummary() {
             const resultsDiv = document.getElementById('workgroup-results');
-            
-            // Group by pipeline and workgroup config
-            const configGroups = new Map();
-            
-            dispatches.forEach(d => {
-                // IMPORTANT: Show ALL dispatches, not just those with occupancy analysis
-                // Skip only if we have neither analysis nor dimension violation
-                if (!d.occupancyAnalysis && !d.dimensionViolation) {
-                    return;
-                }
-                
-                const key = `${d.pipelineLabel}|${d.workgroupSize.join('x')}`;
-                if (!configGroups.has(key)) {
-                    configGroups.set(key, {
-                        pipeline: d.pipelineLabel || 'compute_pipeline',
-                        workgroupSize: d.workgroupSize,
-                        dispatchSize: d.dispatchSize,
-                        analysis: d.occupancyAnalysis || { score: 0, issues: [] },
-                        count: 0,
-                        dimensionViolation: false
-                    });
-                }
-                const group = configGroups.get(key);
-                group.count++;
-                if (d.dimensionViolation) {
-                    group.dimensionViolation = true;
-                }
-            });
-            
-            if (configGroups.size === 0) {
+            if (typeof WebSight === 'undefined') return;
+            const { groups, totalConfigs, goodConfigs, failedConfigs } = WebSight.getWorkgroupSummaryData();
+            if (groups.length === 0) {
                 resultsDiv.innerHTML = '<div style="margin-top: 10px; color: #666;">No workgroup analysis data yet. Run benchmarks first.</div>';
                 return;
             }
@@ -693,7 +548,7 @@
             html += '<th style="padding: 8px; border: 1px solid #000; text-align: left;">Issues</th>';
             html += '</tr>';
             
-            const sortedGroups = Array.from(configGroups.values()).sort((a, b) => a.analysis.score - b.analysis.score);
+            const sortedGroups = groups;
             
             sortedGroups.forEach(group => {
                 const score = group.analysis.score;
@@ -706,25 +561,35 @@
                 html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-weight: bold;">${group.workgroupSize.join(' × ')}</td>`;
                 html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center;">${group.dispatchSize.join(' × ')}</td>`;
                 
-                // Show workgroup utilization
-                if (group.analysis.workgroupUtilization) {
-                    const util = group.analysis.workgroupUtilization;
-                    
-                    // Use explicit flags if available, otherwise calculate
-                    const xExceeds = util.xExceeds !== undefined ? util.xExceeds : (util.xDim > util.maxPerDim);
-                    const yExceeds = util.yExceeds !== undefined ? util.yExceeds : (util.yDim > util.maxPerDim);
-                    const zExceeds = util.zExceeds !== undefined ? util.zExceeds : (util.zDim > util.maxPerDim);
-                    const anyExceeds = xExceeds || yExceeds || zExceeds;
-                    
-                    const utilizationColor = anyExceeds ? '#cc0000' : '#666';
-                    html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-size: 10px; color: ${utilizationColor};">`;
-                    html += `<strong>${util.total.toLocaleString()} WGs</strong><br>`;
-                    html += `<span style="color: ${xExceeds ? '#cc0000' : '#666'}; ${xExceeds ? 'font-weight: bold;' : ''}">X: ${util.xPercent}%${xExceeds ? ' EXCEEDS!' : ''}</span>`;
-                    if (util.yDim > 1) html += `<br><span style="color: ${yExceeds ? '#cc0000' : '#666'}; ${yExceeds ? 'font-weight: bold;' : ''}">Y: ${util.yPercent}%${yExceeds ? ' EXCEEDS!' : ''}</span>`;
-                    if (util.zDim > 1) html += `<br><span style="color: ${zExceeds ? '#cc0000' : '#666'}; ${zExceeds ? 'font-weight: bold;' : ''}">Z: ${util.zPercent}%${zExceeds ? ' EXCEEDS!' : ''}</span>`;
-                    html += '</td>';
-                } else {
-                    html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; color: #999;">—</td>`;
+// Show exact workgroup count (range if multiple input sizes were run)
+                {
+                    const wgCountStr = group.minWGs === group.maxWGs
+                        ? group.minWGs.toLocaleString()
+                        : `${group.minWGs.toLocaleString()} – ${group.maxWGs.toLocaleString()}`;
+
+                    let utilizationCell = `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-size: 10px;">`;
+                    utilizationCell += `<strong>${wgCountStr} WGs</strong>`;
+
+                    if (group.analysis.workgroupUtilization) {
+                        const util = group.analysis.workgroupUtilization;
+                        const xExceeds = util.xExceeds !== undefined ? util.xExceeds : (util.xDim > util.maxPerDim);
+                        const yExceeds = util.yExceeds !== undefined ? util.yExceeds : (util.yDim > util.maxPerDim);
+                        const zExceeds = util.zExceeds !== undefined ? util.zExceeds : (util.zDim > util.maxPerDim);
+                        const anyExceeds = xExceeds || yExceeds || zExceeds;
+                        if (anyExceeds) {
+                            utilizationCell += `<br><span style="color:#cc0000;font-weight:bold;">X: ${util.xPercent}%${xExceeds?' EXCEEDS!':''}</span>`;
+                            if (util.yDim > 1) utilizationCell += `<br><span style="color:${yExceeds?'#cc0000':'#666'};">Y: ${util.yPercent}%${yExceeds?' EXCEEDS!':''}</span>`;
+                            if (util.zDim > 1) utilizationCell += `<br><span style="color:${zExceeds?'#cc0000':'#666'};">Z: ${util.zPercent}%${zExceeds?' EXCEEDS!':''}</span>`;
+                        } else {
+                            // Show actual dispatch dimensions alongside WG count
+                            utilizationCell += `<br><span style="color:#666;">${group.dispatchSize.join(' × ')}</span>`;
+                        }
+                    } else {
+                        utilizationCell += `<br><span style="color:#666;">${group.dispatchSize.join(' × ')}</span>`;
+                    }
+
+                    utilizationCell += '</td>';
+                    html += utilizationCell;
                 }
                 
                 html += `<td style="padding: 8px; border: 1px solid #ccc; text-align: center; font-weight: bold; color: ${scoreColor};">${score}/100</td>`;
@@ -756,12 +621,6 @@
             });
             
             html += '</table>';
-            
-            // Summary stats
-            const totalConfigs = configGroups.size;
-            const goodConfigs = sortedGroups.filter(g => g.analysis.score >= 80 && !g.dimensionViolation).length;
-            const failedConfigs = sortedGroups.filter(g => g.dimensionViolation).length;
-            
             html += '<div style="margin-top: 12px; padding: 10px; border: 2px solid #000; background: #f5f5f5;">';
             html += `<strong>Summary:</strong> ${totalConfigs} configuration${totalConfigs > 1 ? 's' : ''} analyzed | `;
             html += `<span style="color: #00aa00;">${goodConfigs} optimized</span> | `;
@@ -775,13 +634,7 @@
             resultsDiv.innerHTML = html;
         }
 
-        // Helper function to format large numbers (1B, 1M, 1K, etc.)
-        function formatBytes(bytes) {
-            if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
-            if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
-            if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + ' KB';
-            return bytes + ' B';
-        }
+        const formatBytes = (bytes) => WebSight.formatBytes(bytes);
 
         function plotGraph(divId, traces, xLabel, yLabel) {
             const layout = {
@@ -851,58 +704,14 @@
             });
         }
 
-        function plotBufferSizes(buffers) {
-            const bufferArray = Object.values(buffers);
-            if (bufferArray.length === 0) {
+        function plotBufferSizes() {
+            if (typeof WebSight === 'undefined') return;
+            const { labels, series, warnings, maxBufferSizeFormatted } = WebSight.getBufferData();
+            if (labels.length === 0) {
                 document.getElementById('buffer-size-graph').innerHTML = '<div style="padding:20px;">No buffers tracked</div>';
                 return;
             }
-            
-            // Get max buffer size from GPU characteristics (typically 2GB or 4GB)
-            const maxBufferSize = lastReceivedData?.gpuCharacteristics?.limits?.maxBufferSize || (2 * 1024 * 1024 * 1024); // Default 2GB
-            const maxBufferSizeMB = maxBufferSize / (1024 * 1024);
-            const warningThreshold = maxBufferSize * 0.9; // Warn at 90% of max
-            
-            const input = [], output = [], atomic = [], uniform = [], labels = [];
-            const warnings = []; // Track buffers near limit
-            
-            bufferArray.forEach((b, i) => {
-                const label = b.label || `Buffer ${i}`;
-                labels.push(label);
-                const sizeKB = b.size / 1024; // Use KB for display
-                
-                // Check if buffer is near max size
-                if (b.size >= warningThreshold) {
-                    const percentOfMax = ((b.size / maxBufferSize) * 100).toFixed(1);
-                    warnings.push({ label, size: b.size, percentOfMax });
-                }
-                
-                // Categorize by label name (most reliable indicator)
-                const labelLower = (b.label || '').toLowerCase();
-                
-                if (labelLower.includes('atomic')) {
-                    atomic.push(sizeKB);
-                    input.push(0);
-                    output.push(0);
-                    uniform.push(0);
-                } else if (labelLower.includes('uniform')) {
-                    uniform.push(sizeKB);
-                    input.push(0);
-                    output.push(0);
-                    atomic.push(0);
-                } else if (labelLower.includes('output') || labelLower.includes('result') || labelLower.includes('dst')) {
-                    output.push(sizeKB);
-                    input.push(0);
-                    atomic.push(0);
-                    uniform.push(0);
-                } else {
-                    // Default to input
-                    input.push(sizeKB);
-                    output.push(0);
-                    atomic.push(0);
-                    uniform.push(0);
-                }
-            });
+            const { input, output, atomic, uniform } = series;
             
             const traces = [
                 { x: labels, y: input, name: 'Input', type: 'bar', marker: { color: '#0066cc' } },
@@ -934,8 +743,7 @@
                 let warningHtml = '<div style="margin-top: 10px; padding: 10px; background: #fff3cd; border: 2px solid #ff8800; border-radius: 4px; font-size: 11px;">';
                 warningHtml += '<strong style="color: #ff8800;">Buffer Size Warnings:</strong><br>';
                 warnings.forEach(w => {
-                    const sizeMB = (w.size / (1024 * 1024)).toFixed(2);
-                    warningHtml += `• <strong>${w.label}</strong>: ${sizeMB} MB (${w.percentOfMax}% of max ${maxBufferSizeMB.toFixed(0)} MB)<br>`;
+                    warningHtml += `• <strong>${w.label}</strong>: ${w.sizeFormatted} (${w.percentOfMax}% of max ${maxBufferSizeFormatted})<br>`;
                 });
                 warningHtml += '<span style="color: #666; font-size: 10px;">Buffers exceeding 90% of GPU max buffer size may cause allocation failures.</span>';
                 warningHtml += '</div>';
@@ -943,44 +751,9 @@
             }
         }
 
-        function plotAtomicContention(dispatches) {
-            const x = [], y = [];
-            
-            dispatches.forEach((d, i) => {
-                const buffers = d.bufferAccesses || [];
-                
-                // Look for potential atomic buffers (small buffers with relevant names)
-                const atomicBuffers = buffers.filter(b => {
-                    const label = (b.label || '').toLowerCase();
-                    const size = b.size || 0;
-                    const sizeMB = size / (1024 * 1024);
-                    
-                    return (label.includes('atomic') || 
-                           label.includes('hist') || 
-                           label.includes('histogram') ||
-                           label.includes('counter')) &&
-                           sizeMB < 10;
-                });
-                
-                if (atomicBuffers.length > 0) {
-                    // Calculate total threads
-                    const dispatchSize = d.dispatchSize || [d.x || 1, d.y || 1, d.z || 1];
-                    const workgroupSize = d.workgroupSize || [1, 1, 1];
-                    const totalThreads = 
-                        dispatchSize[0] * dispatchSize[1] * dispatchSize[2] *
-                        workgroupSize[0] * workgroupSize[1] * workgroupSize[2];
-                    
-                    // Calculate bins from buffer size
-                    const bufferSize = atomicBuffers[0].size || 0;
-                    const bins = bufferSize / 4;
-                    const threadsPerBin = bins > 0 ? totalThreads / bins : 0;
-                    
-                    if (threadsPerBin > 0) {
-                        x.push(i);
-                        y.push(threadsPerBin);
-                    }
-                }
-            });
+        function plotAtomicContention() {
+            if (typeof WebSight === 'undefined') return;
+            const { x, y } = WebSight.getAtomicContentionData();
             
             if (x.length === 0) {
                 document.getElementById('atomic-graph').innerHTML = 
@@ -999,110 +772,50 @@
             }, { displayModeBar: false, responsive: true });
         }
 
-        function updateDispatchList(dispatches) {
+        function updateDispatchList() {
             const div = document.getElementById('dispatch-list');
-            const recent = dispatches.slice(-20).reverse();
-            
-            div.innerHTML = recent.map(d => {
-                // Use gpuTimeUs (microseconds) which is what the profiler stores
-                const gpuTimeDisplay = d.gpuTimeUs && d.timingSource === 'gpu_timestamp'
-                    ? `${d.gpuTimeUs.toFixed(2)} μs`
-                    : d.cpuTimeUs 
-                    ? `${d.cpuTimeUs.toFixed(2)} μs (CPU fallback)`
-                    : 'pending';
-                
-                const cpuTime = d.cpuTimeUs 
-                    ? d.cpuTimeUs.toFixed(2)
-                    : '0.00';
-                
-                // Create a better label
-                const pipelineLabel = d.pipelineLabel && d.pipelineLabel !== 'unknown' 
-                    ? d.pipelineLabel 
-                    : 'Unlabeled Pipeline';
-                
-                // Use passType instead of type
-                const dispatchType = d.passType || 'unknown';
-                const dispatchTitle = dispatchType === 'draw' 
-                    ? `Draw Call #${d.index}`
-                    : dispatchType === 'compute'
-                    ? `Compute #${d.index}`
-                    : `Dispatch #${d.index}`;
-                
-                // Handle different dispatch types
-                const workgroupInfo = dispatchType === 'compute' 
-                    ? `Dispatch: ${d.dispatchSize ? d.dispatchSize.join('×') : `${d.x}×${d.y}×${d.z}`} | Workgroup: ${d.workgroupSize ? d.workgroupSize.join('×') : '?'}`
-                    : dispatchType === 'draw'
-                    ? `Vertices: ${d.vertexCount}, Instances: ${d.instanceCount}`
-                    : `Type: ${dispatchType}`;
-                
-                // Hide if CPU time is too small (just overhead)
-                if (d.cpuTimeNs < 100) return ''; // Less than 100ns is just noise
-                
-                return `
-                    <div class="dispatch-item">
-                        <strong>${dispatchTitle}</strong><br>
-                        Pipeline: ${pipelineLabel}<br>
-                        ${workgroupInfo}<br>
-                        Time: ${gpuTimeDisplay}
-                    </div>
-                `;
-            }).filter(x => x).join(''); // Filter out empty strings
+            if (typeof WebSight === 'undefined') return;
+            const items = WebSight.getDispatchList();
+            div.innerHTML = items.map(d => `
+                <div class="dispatch-item">
+                    <strong>${d.title}</strong><br>
+                    Pipeline: ${d.pipelineLabel}<br>
+                    ${d.workgroupInfo}<br>
+                    Time: ${d.timeDisplay}
+                </div>
+            `).join('');
         }
 
-        function updateKernelList(kernels) {
+        function updateKernelList() {
             const div = document.getElementById('kernel-list');
-            const kernelArray = Object.values(kernels);
+            if (typeof WebSight === 'undefined') return;
+            const kernels = WebSight.listKernels().filter(k => k.dispatchCount > 0 && k.totalTime > 0);
             
-            if (kernelArray.length === 0) {
+            if (kernels.length === 0) {
                 div.innerHTML = '<div style="padding: 20px; color: #666;">No kernels detected</div>';
                 return;
             }
             
-            // Filter out kernels with no meaningful stats
-            const meaningfulKernels = kernelArray.filter(k => 
-                k.stats && k.stats.count > 0 && k.stats.totalTime > 0
-            );
-            
-            if (meaningfulKernels.length === 0) {
-                div.innerHTML = '<div style="padding: 20px; color: #666;">Collecting kernel statistics...</div>';
-                return;
-            }
-            
-            div.innerHTML = meaningfulKernels.map((k, idx) => {
-                // All kernel stats are in nanoseconds - convert to microseconds and milliseconds
-                const avgTime = k.stats.avgTime ? (k.stats.avgTime / 1000).toFixed(2) : 'N/A';
-                const totalTime = k.stats.totalTime ? (k.stats.totalTime / 1000000).toFixed(3) : 'N/A';
-                const minTime = k.stats.minTime && k.stats.minTime !== Infinity 
-                    ? (k.stats.minTime / 1000).toFixed(2) 
-                    : 'N/A';
-                const maxTime = k.stats.maxTime ? (k.stats.maxTime / 1000).toFixed(2) : 'N/A';
-                
-                // Get workgroup size
+            div.innerHTML = kernels.map((k, idx) => {
                 const wg = k.workgroupSize || [1, 1, 1];
-                const wgStr = Array.isArray(wg) 
-                    ? wg.join('×') 
-                    : `${wg.x || 1}×${wg.y || 1}×${wg.z || 1}`;
-                
-                // Use label if available
-                const kernelName = k.label && k.label.trim() && k.label !== 'compute_pipeline'
-                    ? k.label 
-                    : `Pipeline #${idx + 1}`;
-                
+                const wgStr = Array.isArray(wg) ? wg.join('×') : `${wg.x||1}×${wg.y||1}×${wg.z||1}`;
+                const kernelName = k.label !== 'Unnamed Kernel' ? k.label : `Pipeline #${idx + 1}`;
                 return `
                     <div class="dispatch-item">
                         <strong>${kernelName}</strong><br>
                         Workgroup: ${wgStr}<br>
-                        Calls: ${k.stats.count}<br>
-                        Avg: ${avgTime} μs<br>
-                        Total: ${totalTime} ms<br>
-                        Range: ${minTime} - ${maxTime} μs
+                        Calls: ${k.dispatchCount}<br>
+                        Avg: ${k.avgTime.toFixed(2)} ${k.timeUnit}<br>
+                        Total: ${k.totalTime.toFixed(3)} ${k.timeUnit}<br>
+                        Range: ${k.minTime.toFixed(2)} - ${k.maxTime.toFixed(2)} ${k.timeUnit}
                     </div>
                 `;
             }).join('');
         }
 
-        function updateKernelGraphs(data) {
-            const kernels = Object.values(data.kernels);
+        function updateKernelGraphs() {
+            if (typeof WebSight === 'undefined') return;
+            const kernels = WebSight.getKernelGraphData();
             const div = document.getElementById('kernel-graphs');
             
             if (kernels.length === 0) return;
@@ -1113,34 +826,19 @@
             const container = document.getElementById('kernel-grid-container');
             
             kernels.forEach((kernel, idx) => {
-                const dispatches = data.dispatches.filter(d => d.kernelId === kernel.id && d.gpuTimeNs > 0);
-                if (dispatches.length === 0) return;
-                
                 const boxDiv = document.createElement('div');
                 boxDiv.className = 'box';
-                
-                const avgTime = kernel.stats?.avgTime?.toFixed(2) || 'N/A';
-                const count = kernel.stats?.count || 0;
-                
-                // Use label if available, otherwise create a descriptive name
-                const kernelName = kernel.label && kernel.label.trim() 
-                    ? kernel.label 
-                    : `Kernel ${idx + 1}`;
-                
                 boxDiv.innerHTML = `
-                    <div class="kernel-title">${kernelName} (${count} dispatches, avg: ${avgTime} μs)</div>
+                    <div class="kernel-title">${kernel.label} (${kernel.count} dispatches, avg: ${kernel.avgTimeMs.toFixed(3)} ms)</div>
                     <div id="kernel-graph-${idx}" style="height: 200px;"></div>
                 `;
                 container.appendChild(boxDiv);
                 
-                const x = dispatches.map((d, i) => i);
-                const y = dispatches.map(d => d.gpuTimeNs / 1000);
-                
                 setTimeout(() => {
                     Plotly.react(`kernel-graph-${idx}`, [{
-                        x, y, 
-                        type: 'scatter', 
-                        mode: 'lines+markers',
+                        x: kernel.dispatches.map(d => d.index),
+                        y: kernel.dispatches.map(d => d.timeMs),
+                        type: 'scatter', mode: 'lines+markers',
                         line: { color: '#00aa00', width: 2 },
                         marker: { size: 4, color: '#00aa00' }
                     }], {
@@ -1148,8 +846,7 @@
                         yaxis: { title: 'GPU Time (μs)', tickfont: { size: 9 } },
                         margin: { l: 50, r: 20, t: 20, b: 40 },
                         font: { family: 'Courier New', size: 9 },
-                        plot_bgcolor: '#fff',
-                        paper_bgcolor: '#fff'
+                        plot_bgcolor: '#fff', paper_bgcolor: '#fff'
                     }, { displayModeBar: false, responsive: true });
                 }, 100);
             });
@@ -1278,12 +975,16 @@
             };
             
             if (typeof runWebSightTests === 'function') {
-                await runWebSightTests();
+                try {
+                    await runWebSightTests();
+                } finally {
+                    console.log = oldLog;
+                }
             } else {
                 output = 'Test suite not loaded. Make sure test.js is included.';
+                console.log = oldLog;
             }
             
-            console.log = oldLog;
             div.innerHTML = output;
         }
 
@@ -1300,12 +1001,16 @@
             };
             
             if (typeof window.validateWebSight === 'function') {
-                await window.validateWebSight();
+                try {
+                    await window.validateWebSight();
+                } finally {
+                    console.log = oldLog;
+                }
             } else {
                 output = ' Validation suite not loaded. Make sure validation.js is included.';
+                console.log = oldLog;
             }
             
-            console.log = oldLog;
             div.innerHTML = output;
         }
 
@@ -1355,11 +1060,7 @@
             `;
         }
 
-        function formatTime(ms) {
-            if (ms < 1000) return ms + 'ms';
-            if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
-            return (ms / 60000).toFixed(1) + 'min';
-        }
+        const formatTime = (ms) => WebSight.formatTime(ms);
     </script>
 </body>
 </html>
